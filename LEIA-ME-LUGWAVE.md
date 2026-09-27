@@ -42,7 +42,14 @@ A versão do whatsmeow tem de ser a mesma que `apps/api/go.mod` do CRM pina.
 
 ```
 // apps/api/go.mod
-replace github.com/purpshell/meowcaller => github.com/luanluciano93/meowcaller <sha>
+replace github.com/purpshell/meowcaller => github.com/lugwave/meowcaller v0.0.0-<data>-<sha12>
+```
+
+A versão é a pseudo-versão do commit da `whatsmeow-base`: o `replace` não aceita
+SHA puro. Para obtê-la:
+
+```bash
+go list -m -f '{{.Version}}' github.com/lugwave/meowcaller@<sha>
 ```
 
 A linha `module` continua sendo a do upstream, então o `replace` clássico de fork
