@@ -85,6 +85,13 @@ type engineCall struct {
 	acceptSent              bool
 	pendingVideoEnable      *bool
 	pendingVideoOrientation *int
+
+	// PR upstream #43 (early media): estado do atender tardio.
+	earlyMuteSeen    bool
+	earlyMuteFrom    types.JID
+	earlyMuteCreator types.JID
+	inboundSeen      bool
+	answered         bool
 }
 
 // newEngine creates the engine for a Client.
@@ -640,6 +647,8 @@ func (e *engine) onOffer(ev *events.CallOffer) {
 		e.c.log.Warn().Err(err).Str("call_id", ev.CallID).Msg("preaccept failed")
 	}
 
+	e.maybeStartMedia(ev.CallID)
+
 	if fn := e.c.incomingCallHandler(); fn != nil {
 		fn(call)
 	}
@@ -732,12 +741,24 @@ func (e *engine) answer(c *Call) error {
 		e.maybeStartMedia(c.id)
 		return nil
 	}
+	c.setPhase(CallPhaseConnecting)
 	e.mu.Lock()
 	m.acceptPending = true
+	m.answered = true
+	muteSeen, from, creator, inbound := m.earlyMuteSeen, m.earlyMuteFrom, m.earlyMuteCreator, m.inboundSeen
 	e.mu.Unlock()
 
-	c.setPhase(CallPhaseConnecting)
 	e.maybeStartMedia(c.id)
+	if muteSeen {
+		e.c.log.Info().Str("call_id", c.id).Msg("mute_v2 arrived while ringing; sending accept")
+		e.sendAccept(c.id, from, creator)
+	}
+	if inbound {
+		c.setPhase(CallPhaseActive)
+		if fn := c.onReadyFn(); fn != nil {
+			fn()
+		}
+	}
 	return nil
 }
 
@@ -1181,11 +1202,20 @@ func (e *engine) onCallRaw(callNode *waBinary.Node) bool {
 		e.mu.Lock()
 		m := e.calls[callID]
 		pending := m != nil && m.acceptPending
+		early := m != nil && !pending && m.direction == CallDirectionIncoming && !m.answered && !m.group
+		if early && !m.earlyMuteSeen {
+			m.earlyMuteSeen = true
+			m.earlyMuteFrom = callNode.AttrGetter().JID("from")
+			m.earlyMuteCreator = mv.JID("call-creator")
+		}
 		e.mu.Unlock()
 		if m != nil && m.call != nil {
 			if fn := m.call.onMuteStateFn(); fn != nil {
 				fn(muted)
 			}
+		}
+		if early {
+			return false
 		}
 		if !pending {
 			e.c.log.Debug().
