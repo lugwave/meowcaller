@@ -15,10 +15,19 @@
 # publicado, de mantenedor único, para viabilizar chamada de voz, seria o rabo
 # abanando o cachorro. Então desfazemos a reescrita, que é mecânica.
 #
-# Este NÃO é um fork semântico. Nenhuma linha de lógica é alterada — só o
-# caminho de import. O build é o canário: no dia em que o meowcaller passar a
-# usar uma API que só existe no hypermeow, este script para de compilar, e aí a
-# decisão volta à mesa com aviso em vez de surpresa.
+# A BASE não é um fork semântico: o primeiro commit gerado só muda o caminho de
+# import. O build é o canário: no dia em que o meowcaller passar a usar uma API
+# que só existe no hypermeow, este script para de compilar, e aí a decisão
+# volta à mesa com aviso em vez de surpresa.
+#
+# Por cima da base entram os PATCHES de `patches-lugwave/*.patch`, em ordem de
+# nome, um commit por arquivo, com a autoria original (`git am`). São PRs do
+# upstream ainda não mergeados que o CRM precisa — a lista e o porquê de cada
+# um estão no LEIA-ME-LUGWAVE.md. O script PARA se um patch:
+#   - já está no upstream (aplica ao contrário): tire o arquivo e rode de novo;
+#   - não aplica mais: o upstream mudou por baixo, e o patch tem de ser
+#     refeito à mão (ou o PR foi mergeado com outra forma).
+# Assim regenerar a base nunca perde um patch em silêncio.
 #
 # Uso:
 #   ./scripts/regenerar-base-whatsmeow.sh [versão-do-whatsmeow]
@@ -58,11 +67,11 @@ BASE=$(git rev-parse --short upstream/main)
 # na primeira execução isto apagou o próprio script em pleno uso. Por isso elas
 # são guardadas antes e restauradas depois, e a branch gerada fica
 # autoexplicativa para quem cair nela.
-FERRAMENTAS=(scripts/regenerar-base-whatsmeow.sh LEIA-ME-LUGWAVE.md)
+FERRAMENTAS=(scripts/regenerar-base-whatsmeow.sh LEIA-ME-LUGWAVE.md patches-lugwave)
 GUARDA=$(mktemp -d)
 for f in "${FERRAMENTAS[@]}"; do
   mkdir -p "$GUARDA/$(dirname "$f")"
-  cp "$f" "$GUARDA/$f"
+  cp -r "$f" "$GUARDA/$f"
 done
 trap 'rm -rf "$GUARDA"' EXIT
 
@@ -70,7 +79,8 @@ git checkout -B whatsmeow-base upstream/main
 
 for f in "${FERRAMENTAS[@]}"; do
   mkdir -p "$(dirname "$f")"
-  cp "$GUARDA/$f" "$f"
+  rm -rf "$f"
+  cp -r "$GUARDA/$f" "$f"
 done
 chmod +x scripts/regenerar-base-whatsmeow.sh
 
@@ -88,7 +98,7 @@ echo "==> pinando o whatsmeow em $WHATSMEOW"
 go_cmd mod edit -require="$PARA@$WHATSMEOW"
 go_cmd mod tidy
 
-echo "==> conferindo (o canário)"
+echo "==> conferindo a base, ainda sem os patches (o canário do hypermeow)"
 go_cmd build ./...
 go_cmd vet ./...
 go_cmd test ./...
@@ -102,7 +112,39 @@ pinado em $PARA@$WHATSMEOW.
 
 Build, vet e a suíte de testes do upstream passam sem modificação."
 
+# Os patches entram DEPOIS do commit da base, um commit por arquivo, para que a
+# diferença de lógica em relação ao upstream fique visível no `git log`.
+shopt -s nullglob
+PATCHES=(patches-lugwave/*.patch)
+shopt -u nullglob
+if [ ${#PATCHES[@]} -eq 0 ]; then
+  echo "==> nenhum patch em patches-lugwave/ — a base é o upstream puro"
+else
+  for p in "${PATCHES[@]}"; do
+    echo "==> aplicando $p"
+    if git apply --check --reverse "$p" 2>/dev/null; then
+      echo "ERRO: $p JÁ ESTÁ no upstream $BASE (aplica ao contrário)." >&2
+      echo "      O PR foi mergeado: apague o arquivo na main, tire-o da lista do" >&2
+      echo "      LEIA-ME-LUGWAVE.md e rode este script de novo." >&2
+      exit 1
+    fi
+    if ! git am --3way "$p"; then
+      git am --abort || true
+      echo "ERRO: $p não aplica mais sobre o upstream $BASE." >&2
+      echo "      Confira o PR de origem (LEIA-ME-LUGWAVE.md): ou foi mergeado com" >&2
+      echo "      outra forma, ou o upstream mudou por baixo e o patch precisa ser" >&2
+      echo "      refeito (git format-patch) e substituído em patches-lugwave/." >&2
+      exit 1
+    fi
+  done
+
+  echo "==> conferindo de novo, agora com os patches"
+  go_cmd build ./...
+  go_cmd vet ./...
+  go_cmd test ./...
+fi
+
 echo
-echo "==> pronto: whatsmeow-base sobre upstream $BASE"
+echo "==> pronto: whatsmeow-base sobre upstream $BASE, com ${#PATCHES[@]} patch(es)"
 echo "    empurre com: git push -f origin whatsmeow-base"
 echo "    e pine no CRM com o SHA de $(git rev-parse --short HEAD)"

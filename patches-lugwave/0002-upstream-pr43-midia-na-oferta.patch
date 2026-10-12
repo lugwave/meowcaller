@@ -1,0 +1,284 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: michsantoz <msantoznunes@gmail.com>
+Date: Fri, 2 Oct 2026 02:17:04 -0300
+Subject: [PATCH] =?UTF-8?q?upstream=20#43:=20sobe=20a=20m=C3=ADdia=20de=20?=
+ =?UTF-8?q?entrada=20na=20oferta,=20para=20o=20atender=20tardio=20n=C3=A3o?=
+ =?UTF-8?q?=20ficar=20sem=20=C3=A1udio?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+PR upstream: https://github.com/purpshell/meowcaller/pull/43
+  "engine.go: start inbound media on the offer so a late answer keeps
+  inbound audio"
+Head: 8b2a046b6396bf127b5ab400d783ad4bfbbb9bfc (base c48c3e2), ABERTO em
+12/10/2026. Autor original: @Michsantozz — a autoria deste commit é dele;
+aqui só foi portado.
+
+O que resolve: o relay só fazia a ponte do áudio de quem liga quando a
+nossa alocação vinha logo depois da oferta. Atender uma chamada 1:1 alguns
+segundos depois deixava só o áudio de saída. Na nossa medição (12/10/2026,
+staging), atendendo tarde (5,7–19 s) não entrou NENHUM pacote em 5
+chamadas. Agora onOffer sobe a mídia com a chamada ainda tocando; o
+mute_v2 que chega antes do atender é guardado e o Answer() manda o
+<accept> a partir dele; quem chegar por último entre o Answer() e o
+primeiro RTP de entrada é que marca a chamada como ativa.
+
+O port, em relação ao diff do PR (as únicas diferenças):
+  - engine_early_media_test.go: import de github.com/polymorfa/hypermeow
+    reescrito para go.mau.fi/whatsmeow (a mesma reescrita mecânica da
+    base);
+  - engine.go: o hunk dos campos novos de engineCall conflitava com os
+    campos que o #26 acrescenta na mesma struct; ficaram os dois grupos,
+    os do #43 depois dos do #26, com um comentário de uma linha;
+  - CHANGELOG.md: a entrada do #43 entra depois das do #26.
+
+Riscos conhecidos (ver LEIA-ME-LUGWAVE.md): a mídia sobe em TODA oferta,
+atendida ou não; e o audio_duration do interlocutor passa a contar antes
+do accept.
+
+Este commit CAI quando o upstream mergear o #43: a regeneração da base
+(scripts/regenerar-base-whatsmeow.sh) detecta o patch já presente e para,
+pedindo para tirá-lo de patches-lugwave/.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CHANGELOG.md               | 15 ++++++++
+ engine.go                  | 32 +++++++++++++++-
+ engine_early_media_test.go | 76 ++++++++++++++++++++++++++++++++++++++
+ engine_media.go            | 27 ++++++++++----
+ 4 files changed, 142 insertions(+), 8 deletions(-)
+ create mode 100644 engine_early_media_test.go
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 08902ac..3aaf340 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -58,6 +58,21 @@ All notable changes to meowcaller, tracked per module. Format loosely follows
+   matching the validation state of the existing relay code.
+ 
+ 
++### meowcaller — start inbound media on the offer so a late Answer keeps inbound audio
++- The relay only bridged the caller's audio when our allocation followed the offer
++  closely; answering a 1:1 call after ~2 s left it with outbound audio only (related
++  to #37/#40). `onOffer` now starts media right away while the call stays `ringing`;
++  `maybeStartMedia` no longer moves a ringing inbound call to `connecting`.
++- A `mute_v2` that arrives while ringing is recorded and `Answer` sends the deferred
++  `<accept>` from it. The first inbound RTP before Answer is recorded too, and
++  whichever of Answer / first RTP comes second marks the call active, decided under
++  the engine lock (new `engineCall.answered`, `onFirstInboundRTP`).
++- Unit tests: `TestFirstInboundRTPWhileRingingWaitsForAnswer`,
++  `TestFirstInboundRTPAfterAnswerActivates`, `TestMuteV2WhileRingingIsKeptForAnswer`.
++  Starting media on the offer was live-checked in our integration (inbound calls
++  answered several seconds after the offer carry the caller's audio); the lock-ordered
++  handoff is newer and covered by the unit tests above only.
++
+ ### media/group-runtime — `KAT-verified`
+ 
+ - Hardened live group-call teardown by closing and detaching audio endpoints,
+diff --git a/engine.go b/engine.go
+index b7684b4..df5dd11 100644
+--- a/engine.go
++++ b/engine.go
+@@ -85,6 +85,13 @@ type engineCall struct {
+ 	acceptSent              bool
+ 	pendingVideoEnable      *bool
+ 	pendingVideoOrientation *int
++
++	// PR upstream #43 (early media): estado do atender tardio.
++	earlyMuteSeen    bool
++	earlyMuteFrom    types.JID
++	earlyMuteCreator types.JID
++	inboundSeen      bool
++	answered         bool
+ }
+ 
+ // newEngine creates the engine for a Client.
+@@ -640,6 +647,8 @@ func (e *engine) onOffer(ev *events.CallOffer) {
+ 		e.c.log.Warn().Err(err).Str("call_id", ev.CallID).Msg("preaccept failed")
+ 	}
+ 
++	e.maybeStartMedia(ev.CallID)
++
+ 	if fn := e.c.incomingCallHandler(); fn != nil {
+ 		fn(call)
+ 	}
+@@ -732,12 +741,24 @@ func (e *engine) answer(c *Call) error {
+ 		e.maybeStartMedia(c.id)
+ 		return nil
+ 	}
++	c.setPhase(CallPhaseConnecting)
+ 	e.mu.Lock()
+ 	m.acceptPending = true
++	m.answered = true
++	muteSeen, from, creator, inbound := m.earlyMuteSeen, m.earlyMuteFrom, m.earlyMuteCreator, m.inboundSeen
+ 	e.mu.Unlock()
+ 
+-	c.setPhase(CallPhaseConnecting)
+ 	e.maybeStartMedia(c.id)
++	if muteSeen {
++		e.c.log.Info().Str("call_id", c.id).Msg("mute_v2 arrived while ringing; sending accept")
++		e.sendAccept(c.id, from, creator)
++	}
++	if inbound {
++		c.setPhase(CallPhaseActive)
++		if fn := c.onReadyFn(); fn != nil {
++			fn()
++		}
++	}
+ 	return nil
+ }
+ 
+@@ -1181,12 +1202,21 @@ func (e *engine) onCallRaw(callNode *waBinary.Node) bool {
+ 		e.mu.Lock()
+ 		m := e.calls[callID]
+ 		pending := m != nil && m.acceptPending
++		early := m != nil && !pending && m.direction == CallDirectionIncoming && !m.answered && !m.group
++		if early && !m.earlyMuteSeen {
++			m.earlyMuteSeen = true
++			m.earlyMuteFrom = callNode.AttrGetter().JID("from")
++			m.earlyMuteCreator = mv.JID("call-creator")
++		}
+ 		e.mu.Unlock()
+ 		if m != nil && m.call != nil {
+ 			if fn := m.call.onMuteStateFn(); fn != nil {
+ 				fn(muted)
+ 			}
+ 		}
++		if early {
++			return false
++		}
+ 		if !pending {
+ 			e.c.log.Debug().
+ 				Str("call_id", callID).
+diff --git a/engine_early_media_test.go b/engine_early_media_test.go
+new file mode 100644
+index 0000000..793df1a
+--- /dev/null
++++ b/engine_early_media_test.go
+@@ -0,0 +1,76 @@
++package meowcaller
++
++import (
++	"testing"
++
++	waBinary "go.mau.fi/whatsmeow/binary"
++)
++
++func testEngineWithIncomingCall() (*engine, *Call, *int) {
++	c := &Client{}
++	c.eng = newEngine(c)
++	call := &Call{eng: c.eng, id: "CID", peer: peerJID(), phase: CallPhaseRinging}
++	ready := 0
++	call.OnReady(func() { ready++ })
++	c.eng.calls["CID"] = &engineCall{
++		call:      call,
++		direction: CallDirectionIncoming,
++		from:      peerJID(),
++		creator:   creatorJID(),
++	}
++	return c.eng, call, &ready
++}
++
++func TestFirstInboundRTPWhileRingingWaitsForAnswer(t *testing.T) {
++	eng, call, ready := testEngineWithIncomingCall()
++
++	eng.onFirstInboundRTP("CID", call)
++	if call.State() != CallPhaseRinging || *ready != 0 {
++		t.Fatalf("before answer: phase=%v ready=%d, want ringing and not ready", call.State(), *ready)
++	}
++
++	if err := eng.answer(call); err != nil {
++		t.Fatalf("answer: %v", err)
++	}
++	if call.State() != CallPhaseActive || *ready != 1 {
++		t.Fatalf("after answer: phase=%v ready=%d, want active and ready once", call.State(), *ready)
++	}
++}
++
++func TestFirstInboundRTPAfterAnswerActivates(t *testing.T) {
++	eng, call, ready := testEngineWithIncomingCall()
++
++	if err := eng.answer(call); err != nil {
++		t.Fatalf("answer: %v", err)
++	}
++	if call.State() != CallPhaseConnecting || *ready != 0 {
++		t.Fatalf("after answer: phase=%v ready=%d, want connecting", call.State(), *ready)
++	}
++
++	eng.onFirstInboundRTP("CID", call)
++	if call.State() != CallPhaseActive || *ready != 1 {
++		t.Fatalf("after first RTP: phase=%v ready=%d, want active and ready once", call.State(), *ready)
++	}
++}
++
++func TestMuteV2WhileRingingIsKeptForAnswer(t *testing.T) {
++	eng, call, _ := testEngineWithIncomingCall()
++	node := &waBinary.Node{
++		Tag:   "call",
++		Attrs: waBinary.Attrs{"from": peerJID(), "id": "N1"},
++		Content: []waBinary.Node{{Tag: "mute_v2", Attrs: waBinary.Attrs{
++			"call-id": "CID", "call-creator": creatorJID(), "mute-state": "0",
++		}}},
++	}
++
++	if handled := eng.onCallRaw(node); handled {
++		t.Fatal("mute_v2 while ringing should not be consumed")
++	}
++	m := eng.calls[call.ID()]
++	if !m.earlyMuteSeen || m.earlyMuteFrom != peerJID() || m.earlyMuteCreator != creatorJID() {
++		t.Fatalf("early mute not recorded: seen=%v from=%s creator=%s", m.earlyMuteSeen, m.earlyMuteFrom, m.earlyMuteCreator)
++	}
++	if call.State() != CallPhaseRinging {
++		t.Fatalf("phase = %v, want ringing", call.State())
++	}
++}
+diff --git a/engine_media.go b/engine_media.go
+index 35ffd09..6cef099 100644
+--- a/engine_media.go
++++ b/engine_media.go
+@@ -95,7 +95,7 @@ func (e *engine) maybeStartMedia(callID string) {
+ 	inbound := m.direction == CallDirectionIncoming
+ 	e.mu.Unlock()
+ 
+-	if call != nil {
++	if call != nil && !(inbound && call.State() == CallPhaseRinging) {
+ 		call.setPhase(CallPhaseConnecting)
+ 	}
+ 	e.c.log.Info().Str("call_id", callID).Msg("starting media")
+@@ -1201,12 +1201,7 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
+ 		if rtpIn++; rtpIn == 1 {
+ 			log.Info().Msg("first RTP decoded from relay, inbound audio flowing")
+ 			e.c.diag.Emit("meta", map[string]any{"event": "first_rtp_in", "call_id": callID})
+-			if call != nil {
+-				call.setPhase(CallPhaseActive)
+-				if fn := call.onReadyFn(); fn != nil {
+-					fn()
+-				}
+-			}
++			e.onFirstInboundRTP(callID, call)
+ 		}
+ 	}
+ }
+@@ -1650,3 +1645,21 @@ func rmsFloat32(f []float32) float64 {
+ 	}
+ 	return math.Sqrt(sum / float64(len(f)))
+ }
++
++// onFirstInboundRTP marks the call active on its first inbound RTP. An incoming call
++// still ringing only records it; Answer then activates the call.
++func (e *engine) onFirstInboundRTP(callID string, call *Call) {
++	promote := true
++	e.mu.Lock()
++	if em := e.calls[callID]; em != nil {
++		em.inboundSeen = true
++		promote = em.direction != CallDirectionIncoming || em.answered
++	}
++	e.mu.Unlock()
++	if promote && call != nil && call.State() == CallPhaseConnecting {
++		call.setPhase(CallPhaseActive)
++		if fn := call.onReadyFn(); fn != nil {
++			fn()
++		}
++	}
++}
