@@ -282,6 +282,14 @@ func (c *Call) Reject() error { return c.eng.reject(c) }
 // Hangup ends the call (either direction) and tears down media.
 func (c *Call) Hangup() error { return c.eng.hangup(c) }
 
+// EndLocal ends the call on this device only: media is torn down and OnEnd fires
+// with reason, but no stanza is sent, so the caller and the account's other devices
+// see nothing. Use it for an inbound call this device stopped caring about (nobody
+// answered it here, another device took it) where Reject or Hangup would act on a
+// call that is still live elsewhere. Ending a call that already ended is a no-op
+// and OnEnd does not fire again. An empty reason is reported as "local".
+func (c *Call) EndLocal(reason string) error { return c.eng.endLocal(c, reason) }
+
 // StartVideo requests an audio-to-video upgrade. Outbound video remains gated until
 // the peer acknowledges the transition with state 4 or state 1.
 func (c *Call) StartVideo() error {

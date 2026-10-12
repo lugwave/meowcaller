@@ -844,6 +844,15 @@ func (e *engine) hangup(c *Call) error {
 	return nil
 }
 
+// endLocal ends a call without telling anyone: finishCall with no stanza on the wire.
+func (e *engine) endLocal(c *Call, reason string) error {
+	if reason == "" {
+		reason = "local"
+	}
+	e.finishCall(c.id, reason)
+	return nil
+}
+
 // onRelay records relay data from a relaylatency/transport/ack stanza and starts media
 // once both the callKey and the relay endpoint are known.
 func (e *engine) onRelay(callID string, data *waBinary.Node) {
@@ -974,7 +983,11 @@ func (e *engine) onPreAccept(ev *events.CallPreAccept) {
 // from relay allocation, but inbound RTP is still what marks the call ready/active.
 func (e *engine) onAccept(ev *events.CallAccept) {
 	m := e.lookup(ev.CallID)
-	if m == nil || m.direction != CallDirectionOutgoing {
+	if m == nil {
+		return
+	}
+	if m.direction != CallDirectionOutgoing {
+		e.onInboundAcceptElsewhere(ev)
 		return
 	}
 	if m.call != nil && m.call.State() == CallPhaseEnded {
@@ -1034,6 +1047,45 @@ func (e *engine) onAccept(ev *events.CallAccept) {
 		"from": ev.From.String(), "platform": ev.RemotePlatform, "video": m.localVideo || m.remoteVideo,
 	})
 	e.maybeStartMedia(ev.CallID)
+}
+
+// onInboundAcceptElsewhere ends, locally, an inbound 1:1 call that another device of
+// this same account answered. Media has been up since the offer, and the server's
+// <terminate reason="accepted_elsewhere"> is the only other thing that would stop it:
+// when that terminate is lost the loops would keep sending to the relay for as long
+// as the conversation on the other device lasts. Nothing is sent: the call belongs to
+// the device that answered. Group calls and calls this device answered are left alone.
+func (e *engine) onInboundAcceptElsewhere(ev *events.CallAccept) {
+	e.mu.Lock()
+	m := e.calls[ev.CallID]
+	skip := m == nil || m.direction != CallDirectionIncoming || m.group || m.answered
+	e.mu.Unlock()
+	if skip || !e.isOwnOtherDevice(ev.From) {
+		return
+	}
+	if e.c != nil {
+		e.c.log.Info().
+			Str("call_id", ev.CallID).
+			Str("from", ev.From.String()).
+			Msg("inbound call accepted on another device of this account; ending it locally")
+	}
+	e.finishCall(ev.CallID, "accepted_elsewhere")
+}
+
+// isOwnOtherDevice reports whether jid is a device of this account other than this
+// one: the account's phone-number or LID user with a different device id (the primary
+// phone is device 0, a linked device never is).
+func (e *engine) isOwnOtherDevice(jid types.JID) bool {
+	if jid.IsEmpty() || e.c == nil || e.c.ownGroupJIDs == nil {
+		return false
+	}
+	for _, own := range e.c.ownGroupJIDs() {
+		if own.IsEmpty() || own.User != jid.User || own.Server != jid.Server {
+			continue
+		}
+		return own.Device != jid.Device
+	}
+	return false
 }
 
 func inviteDeviceCapability(device types.JID, node *waBinary.Node) (groupCallDevice, bool) {
