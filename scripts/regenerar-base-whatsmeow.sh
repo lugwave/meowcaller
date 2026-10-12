@@ -22,8 +22,9 @@
 #
 # Por cima da base entram os PATCHES de `patches-lugwave/*.patch`, em ordem de
 # nome, um commit por arquivo, com a autoria original (`git am`). São PRs do
-# upstream ainda não mergeados que o CRM precisa — a lista e o porquê de cada
-# um estão no LEIA-ME-LUGWAVE.md. O script PARA se um patch:
+# upstream ainda não mergeados que o CRM precisa e, desde 12/10/2026, um patch
+# NOSSO (0003, o encerrar só local) — a lista e o porquê de cada um estão no
+# LEIA-ME-LUGWAVE.md. O script PARA se um patch:
 #   - já está no upstream (aplica ao contrário): tire o arquivo e rode de novo;
 #   - não aplica mais: o upstream mudou por baixo, e o patch tem de ser
 #     refeito à mão (ou o PR foi mergeado com outra forma).
