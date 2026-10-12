@@ -1,0 +1,316 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Luan Luciano <luanluciano93@gmail.com>
+Date: Mon, 12 Oct 2026 23:08:08 +0000
+Subject: [PATCH] =?UTF-8?q?lugwave:=20encerrar=20s=C3=B3=20local=20(Call.E?=
+ =?UTF-8?q?ndLocal)=20e=20o=20accept=20de=20outro=20aparelho=20da=20conta?=
+ =?UTF-8?q?=20encerra=20a=20chamada=20de=20entrada?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Patch NOSSO — não é PR do upstream (vale propor lá). Dois consertos pequenos
+no mesmo ponto, o fim de uma chamada de ENTRADA que este aparelho não atendeu:
+
+1. Call.EndLocal(reason): finishCall sem stanza nenhuma. A mídia para, o OnEnd
+   dispara com o motivo dado, e nem quem liga nem os outros aparelhos da conta
+   veem nada. Idempotente. A lib só sabia encerrar falando com o WhatsApp
+   (Reject manda <reject>, Hangup manda <terminate>), e desde o #43 a mídia
+   sobe em toda oferta sem teto de tempo: quem hospeda a lib precisa poder
+   cancelar a mídia de uma chamada que deixou de interessar SEM mexer numa
+   chamada que pode estar viva em outro lugar (ainda tocando, ou em conversa
+   no celular pareado).
+
+2. engine.onAccept: o <accept> de uma chamada de entrada 1:1 que vem de OUTRO
+   aparelho da própria conta (mesmo usuário, por telefone ou por LID, com
+   device diferente — o celular é o device 0) encerra a chamada aqui,
+   localmente, com o motivo "accepted_elsewhere". Antes o accept era ignorado
+   para toda chamada que não fosse de saída, e a mídia só parava se o
+   <terminate reason="accepted_elsewhere"> do servidor chegasse.
+
+Não muda: o caminho de saída (o accept de uma chamada que nós fizemos segue
+sendo "o peer atendeu"), chamada em grupo, e chamada que este aparelho já
+atendeu.
+
+Testes em end_local_test.go.
+---
+ end_local_test.go | 171 ++++++++++++++++++++++++++++++++++++++++++++++
+ engine.go         |  54 ++++++++++++++-
+ livecall.go       |   8 +++
+ 3 files changed, 232 insertions(+), 1 deletion(-)
+ create mode 100644 end_local_test.go
+
+diff --git a/end_local_test.go b/end_local_test.go
+new file mode 100644
+index 0000000..49f0501
+--- /dev/null
++++ b/end_local_test.go
+@@ -0,0 +1,171 @@
++package meowcaller
++
++import (
++	"context"
++	"testing"
++
++	waBinary "go.mau.fi/whatsmeow/binary"
++	"go.mau.fi/whatsmeow/types"
++	"go.mau.fi/whatsmeow/types/events"
++)
++
++// This account in the tests: a linked device (device 7) of one user, known by its
++// phone number and by its LID. The primary phone is device 0 of the same user.
++func ownPN() types.JID {
++	return types.JID{User: "5511900000000", Server: types.DefaultUserServer, Device: 7}
++}
++func ownLID() types.JID {
++	return types.JID{User: "333333333333333", Server: types.HiddenUserServer, Device: 7}
++}
++
++// inboundRingingEngine is an inbound 1:1 call with media already up (as it is since
++// the offer), on a client that knows its own JIDs. sent counts stanzas put on the
++// wire; canceled reports that the media context was canceled.
++func inboundRingingEngine() (eng *engine, call *Call, sent *int, canceled *bool, reasons *[]string) {
++	eng, call, _ = testEngineWithIncomingCall()
++	eng.c.ownGroupJIDs = func() []types.JID { return []types.JID{ownPN(), ownLID()} }
++	sent, canceled, reasons = new(int), new(bool), new([]string)
++	eng.sendCallNode = func(context.Context, waBinary.Node) error { *sent++; return nil }
++	eng.calls["CID"].started = true
++	eng.calls["CID"].cancel = func() { *canceled = true }
++	call.OnEnd(func(r string) { *reasons = append(*reasons, r) })
++	return eng, call, sent, canceled, reasons
++}
++
++func acceptFrom(from types.JID) *events.CallAccept {
++	return &events.CallAccept{BasicCallMeta: types.BasicCallMeta{
++		CallID: "CID", From: from, CallCreator: creatorJID(),
++	}}
++}
++
++// EndLocal tears the call down here and says nothing to anyone.
++func TestEndLocalTearsDownWithoutSignaling(t *testing.T) {
++	eng, call, sent, canceled, reasons := inboundRingingEngine()
++
++	if err := call.EndLocal("ring_timeout"); err != nil {
++		t.Fatalf("EndLocal: %v", err)
++	}
++	if *sent != 0 {
++		t.Fatalf("EndLocal put %d stanza(s) on the wire, want none", *sent)
++	}
++	if !*canceled {
++		t.Fatal("EndLocal did not cancel local media")
++	}
++	if call.State() != CallPhaseEnded || eng.lookup("CID") != nil {
++		t.Fatalf("after EndLocal: phase=%d, still registered=%v", call.State(), eng.lookup("CID") != nil)
++	}
++	if len(*reasons) != 1 || (*reasons)[0] != "ring_timeout" {
++		t.Fatalf("OnEnd reasons = %v, want [ring_timeout]", *reasons)
++	}
++
++	// Idempotent, and a late <terminate> for the same call changes nothing.
++	if err := call.EndLocal("again"); err != nil {
++		t.Fatalf("second EndLocal: %v", err)
++	}
++	eng.onTerminate("CID", "timeout")
++	if len(*reasons) != 1 || *sent != 0 {
++		t.Fatalf("after a second end: reasons=%v sent=%d, want one reason and nothing sent", *reasons, *sent)
++	}
++}
++
++func TestEndLocalDefaultsTheReason(t *testing.T) {
++	_, call, _, _, reasons := inboundRingingEngine()
++	_ = call.EndLocal("")
++	if len(*reasons) != 1 || (*reasons)[0] != "local" {
++		t.Fatalf("OnEnd reasons = %v, want [local]", *reasons)
++	}
++}
++
++// EndLocal also ends an outgoing call locally without a <terminate>.
++func TestEndLocalOnOutgoingCallSendsNothing(t *testing.T) {
++	eng, call := testEngineWithOutgoingCall()
++	sent := 0
++	eng.sendCallNode = func(context.Context, waBinary.Node) error { sent++; return nil }
++	_ = call.EndLocal("drop")
++	if sent != 0 || call.State() != CallPhaseEnded {
++		t.Fatalf("sent=%d phase=%d, want nothing sent and Ended", sent, call.State())
++	}
++}
++
++// The <accept> of an inbound call coming from another device of this account (the
++// paired phone answered) ends the call here, locally: media stops, nothing is sent.
++func TestInboundAcceptFromOwnOtherDeviceEndsLocally(t *testing.T) {
++	for name, from := range map[string]types.JID{
++		"primary phone, by phone number": {User: ownPN().User, Server: types.DefaultUserServer},
++		"primary phone, by LID":          {User: ownLID().User, Server: types.HiddenUserServer},
++		"another linked device":          {User: ownLID().User, Server: types.HiddenUserServer, Device: 12},
++	} {
++		eng, call, sent, canceled, reasons := inboundRingingEngine()
++
++		eng.onAccept(acceptFrom(from))
++
++		if call.State() != CallPhaseEnded || eng.lookup("CID") != nil || !*canceled {
++			t.Fatalf("%s: phase=%d registered=%v canceled=%v, want ended and media canceled",
++				name, call.State(), eng.lookup("CID") != nil, *canceled)
++		}
++		if len(*reasons) != 1 || (*reasons)[0] != "accepted_elsewhere" {
++			t.Fatalf("%s: OnEnd reasons = %v, want [accepted_elsewhere]", name, *reasons)
++		}
++		if *sent != 0 {
++			t.Fatalf("%s: %d stanza(s) sent, want none — the call belongs to the device that answered", name, *sent)
++		}
++	}
++}
++
++// Any other <accept> leaves an inbound call exactly as it was.
++func TestInboundAcceptThatIsNotOwnOtherDeviceIsIgnored(t *testing.T) {
++	stranger := types.JID{User: "444444444444444", Server: types.HiddenUserServer, Device: 3}
++	cases := map[string]struct {
++		from  types.JID
++		setup func(*engine)
++	}{
++		"the caller":             {from: peerJID()},
++		"someone else":           {from: stranger},
++		"this very device (PN)":  {from: ownPN()},
++		"this very device (LID)": {from: ownLID()},
++		"no sender":              {from: types.JID{}},
++		"a group call": {
++			from:  types.JID{User: ownLID().User, Server: types.HiddenUserServer},
++			setup: func(e *engine) { e.calls["CID"].group = true },
++		},
++		"a call this device answered": {
++			from:  types.JID{User: ownLID().User, Server: types.HiddenUserServer},
++			setup: func(e *engine) { e.calls["CID"].answered = true },
++		},
++		"own JIDs unknown": {
++			from:  types.JID{User: ownLID().User, Server: types.HiddenUserServer},
++			setup: func(e *engine) { e.c.ownGroupJIDs = nil },
++		},
++	}
++	for name, tc := range cases {
++		eng, call, sent, canceled, reasons := inboundRingingEngine()
++		if tc.setup != nil {
++			tc.setup(eng)
++		}
++
++		eng.onAccept(acceptFrom(tc.from))
++
++		if call.State() != CallPhaseRinging || eng.lookup("CID") == nil || *canceled || len(*reasons) != 0 || *sent != 0 {
++			t.Fatalf("%s: phase=%d registered=%v canceled=%v reasons=%v sent=%d, want the call untouched",
++				name, call.State(), eng.lookup("CID") != nil, *canceled, *reasons, *sent)
++		}
++	}
++}
++
++// The outgoing path is untouched: an <accept> from this account's own other device
++// on a call WE placed is still "the peer answered", never a local end.
++func TestOutgoingAcceptIsNeverAnAcceptElsewhere(t *testing.T) {
++	eng, call := testEngineWithOutgoingCall()
++	eng.c.ownGroupJIDs = func() []types.JID { return []types.JID{ownPN(), ownLID()} }
++	accepted := false
++	call.OnPeerAccept(func() { accepted = true })
++
++	eng.onAccept(acceptFrom(types.JID{User: ownLID().User, Server: types.HiddenUserServer}))
++
++	if call.State() == CallPhaseEnded || eng.lookup("CID") == nil {
++		t.Fatal("an accept on an outgoing call ended it")
++	}
++	if !accepted {
++		t.Fatal("the outgoing accept was not delivered to OnPeerAccept")
++	}
++}
+diff --git a/engine.go b/engine.go
+index df5dd11..b0c628f 100644
+--- a/engine.go
++++ b/engine.go
+@@ -844,6 +844,15 @@ func (e *engine) hangup(c *Call) error {
+ 	return nil
+ }
+ 
++// endLocal ends a call without telling anyone: finishCall with no stanza on the wire.
++func (e *engine) endLocal(c *Call, reason string) error {
++	if reason == "" {
++		reason = "local"
++	}
++	e.finishCall(c.id, reason)
++	return nil
++}
++
+ // onRelay records relay data from a relaylatency/transport/ack stanza and starts media
+ // once both the callKey and the relay endpoint are known.
+ func (e *engine) onRelay(callID string, data *waBinary.Node) {
+@@ -974,7 +983,11 @@ func (e *engine) onPreAccept(ev *events.CallPreAccept) {
+ // from relay allocation, but inbound RTP is still what marks the call ready/active.
+ func (e *engine) onAccept(ev *events.CallAccept) {
+ 	m := e.lookup(ev.CallID)
+-	if m == nil || m.direction != CallDirectionOutgoing {
++	if m == nil {
++		return
++	}
++	if m.direction != CallDirectionOutgoing {
++		e.onInboundAcceptElsewhere(ev)
+ 		return
+ 	}
+ 	if m.call != nil && m.call.State() == CallPhaseEnded {
+@@ -1036,6 +1049,45 @@ func (e *engine) onAccept(ev *events.CallAccept) {
+ 	e.maybeStartMedia(ev.CallID)
+ }
+ 
++// onInboundAcceptElsewhere ends, locally, an inbound 1:1 call that another device of
++// this same account answered. Media has been up since the offer, and the server's
++// <terminate reason="accepted_elsewhere"> is the only other thing that would stop it:
++// when that terminate is lost the loops would keep sending to the relay for as long
++// as the conversation on the other device lasts. Nothing is sent: the call belongs to
++// the device that answered. Group calls and calls this device answered are left alone.
++func (e *engine) onInboundAcceptElsewhere(ev *events.CallAccept) {
++	e.mu.Lock()
++	m := e.calls[ev.CallID]
++	skip := m == nil || m.direction != CallDirectionIncoming || m.group || m.answered
++	e.mu.Unlock()
++	if skip || !e.isOwnOtherDevice(ev.From) {
++		return
++	}
++	if e.c != nil {
++		e.c.log.Info().
++			Str("call_id", ev.CallID).
++			Str("from", ev.From.String()).
++			Msg("inbound call accepted on another device of this account; ending it locally")
++	}
++	e.finishCall(ev.CallID, "accepted_elsewhere")
++}
++
++// isOwnOtherDevice reports whether jid is a device of this account other than this
++// one: the account's phone-number or LID user with a different device id (the primary
++// phone is device 0, a linked device never is).
++func (e *engine) isOwnOtherDevice(jid types.JID) bool {
++	if jid.IsEmpty() || e.c == nil || e.c.ownGroupJIDs == nil {
++		return false
++	}
++	for _, own := range e.c.ownGroupJIDs() {
++		if own.IsEmpty() || own.User != jid.User || own.Server != jid.Server {
++			continue
++		}
++		return own.Device != jid.Device
++	}
++	return false
++}
++
+ func inviteDeviceCapability(device types.JID, node *waBinary.Node) (groupCallDevice, bool) {
+ 	// Source of truth: https://github.com/purpshell/meowcaller/blob/1ebd064663ac336ff3d1fc65d9baa974148fe73e/datasheets/voip-group-participant-invite.md#L36-L72
+ 	if device.IsEmpty() {
+diff --git a/livecall.go b/livecall.go
+index 67c10dd..cd444a2 100644
+--- a/livecall.go
++++ b/livecall.go
+@@ -282,6 +282,14 @@ func (c *Call) Reject() error { return c.eng.reject(c) }
+ // Hangup ends the call (either direction) and tears down media.
+ func (c *Call) Hangup() error { return c.eng.hangup(c) }
+ 
++// EndLocal ends the call on this device only: media is torn down and OnEnd fires
++// with reason, but no stanza is sent, so the caller and the account's other devices
++// see nothing. Use it for an inbound call this device stopped caring about (nobody
++// answered it here, another device took it) where Reject or Hangup would act on a
++// call that is still live elsewhere. Ending a call that already ended is a no-op
++// and OnEnd does not fire again. An empty reason is reported as "local".
++func (c *Call) EndLocal(reason string) error { return c.eng.endLocal(c, reason) }
++
+ // StartVideo requests an audio-to-video upgrade. Outbound video remains gated until
+ // the peer acknowledges the transition with state 4 or state 1.
+ func (c *Call) StartVideo() error {

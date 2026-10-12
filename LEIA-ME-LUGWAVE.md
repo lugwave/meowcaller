@@ -8,7 +8,7 @@ dele, publicado de graça.
 ## O que este fork muda
 
 A branch [`whatsmeow-base`](../../tree/whatsmeow-base) — a que o CRM consome — é
-o `main` do upstream com **duas camadas** por cima, cada uma em commits próprios:
+o `main` do upstream com **três camadas** por cima, cada uma em commits próprios:
 
 1. **A base** (um commit, mecânico): o caminho de import volta de
    `github.com/polymorfa/hypermeow` para `go.mau.fi/whatsmeow`. Nenhuma linha de
@@ -16,11 +16,16 @@ o `main` do upstream com **duas camadas** por cima, cada uma em commits próprio
 2. **Os PRs carregados** (um commit por PR, com a autoria de quem escreveu):
    consertos abertos no upstream, ainda não mergeados, sem os quais a chamada de
    voz não tem áudio de entrada no nosso uso. **Aqui a lógica muda.**
+3. **Um patch nosso** (um commit, desde 12/10/2026): o encerrar só local. Não é
+   PR do upstream — é lógica escrita por nós, pequena, e a intenção é propô-la
+   lá. **Aqui a lógica também muda.**
 
 Até 12/10/2026 este arquivo prometia que o fork "não muda uma linha de lógica".
-**Essa promessa deixou de valer** com a camada 2. O que continua valendo: nada
-de lógica nossa mora aqui. Cada mudança de lógica é um PR do upstream,
-identificado abaixo, e sai no dia em que o upstream o mergear.
+**Essa promessa deixou de valer** com a camada 2, e a de que "nada de lógica
+nossa mora aqui" deixou de valer com a camada 3. O que continua valendo: toda
+mudança de lógica está identificada abaixo, num patch versionado, com o porquê
+e o critério de saída — os PRs do upstream saem quando ele os mergear; o patch
+nosso sai quando o upstream tiver o equivalente.
 
 A `main` deste fork acompanha o `main` do upstream (hypermeow) e só acrescenta
 as ferramentas: este arquivo, `scripts/regenerar-base-whatsmeow.sh` e
@@ -113,6 +118,71 @@ Para carregar um PR novo: aplique-o sobre a `whatsmeow-base`, commite com
 prefixo numérico define a ordem), e documente-o aqui — PR, head, o que resolve,
 a medição e os riscos.
 
+## Patch nosso (não é PR do upstream)
+
+| # | Título | Autor | Arquivo |
+| --- | --- | --- | --- |
+| 3 | Encerrar só local (`Call.EndLocal`) e o `<accept>` de outro aparelho da conta encerra a chamada de entrada | Lugwave | `0003-lugwave-encerrar-local.patch` |
+
+Aplica depois dos dois PRs (mexe no `engine.onAccept` e no `livecall.go`, que
+eles não tocam nesses pontos).
+
+### O que faz
+
+1. **`Call.EndLocal(reason string) error`** — `finishCall` sem stanza nenhuma:
+   a mídia para, o `OnEnd` dispara com o motivo dado (vazio vira `"local"`), e
+   nem quem liga nem os outros aparelhos da conta veem nada. Idempotente: numa
+   chamada que já acabou não faz nada e o `OnEnd` não dispara de novo.
+2. **`engine.onAccept`** — o `<accept>` de uma chamada de **entrada** 1:1 que
+   vem de **outro aparelho da própria conta** encerra a chamada aqui,
+   localmente, com o motivo `accepted_elsewhere`. "Outro aparelho da própria
+   conta" é: mesmo usuário e servidor de um dos JIDs da conta (o de telefone
+   ou o LID) com `Device` diferente do nosso — o celular é o device 0, um
+   aparelho conectado nunca é.
+
+Não muda: o caminho de saída (o `<accept>` de uma chamada que nós fizemos segue
+sendo "o peer atendeu"), chamada em grupo, e chamada que este aparelho já
+atendeu.
+
+### Por quê
+
+Com o #43 a mídia sobe em **toda** oferta e a lib não tem teto de tempo: ela só
+para no `finishCall`. E a lib só sabia encerrar falando com o WhatsApp —
+`Reject` manda `<reject>`, `Hangup` manda `<terminate>`. Para o CRM isso deixava
+dois casos sem saída segura:
+
+- **a chamada que ninguém atendeu pelo CRM e cujo `<terminate>` se perdeu.** A
+  mídia ficava de pé até o restart. Cancelá-la com `Reject`/`Hangup` é mandar
+  um sinal numa chamada que pode estar viva em outro lugar — ainda tocando no
+  celular do cliente (ele pararia de tocar; quem liga veria "recusada") ou já
+  em conversa nele. Com `EndLocal` o CRM cancela a mídia e não manda nada;
+- **a chamada atendida no celular pareado.** A lib ignorava o `<accept>` de
+  toda chamada que não fosse de saída; a mídia só parava se o
+  `<terminate reason="accepted_elsewhere">` do servidor chegasse. Se ele se
+  perdia, a lib transmitia silêncio ao relay durante a conversa inteira do
+  celular.
+
+### Riscos conhecidos
+
+- **Não validado com chamada real.** Os testes são de unidade
+  (`end_local_test.go`); que o WhatsApp entrega aos aparelhos irmãos o
+  `<accept>` de quem atendeu, e com que `from`, foi lido no CRM (o evento
+  `CallAccept` já é tratado lá como "atendida no aparelho"), não medido aqui.
+- Se a comparação de JID falhar para algum formato de `from` que não previmos,
+  o comportamento é o de antes (o accept é ignorado) — o erro é para o lado
+  seguro.
+- `EndLocal` numa chamada que este aparelho **atendeu** deixa o outro lado numa
+  ligação muda até ele desistir: para chamada em conversa o certo continua
+  sendo `Hangup`.
+
+### Critério de saída
+
+Sai quando o upstream tiver um encerrar local e tratar o accept de outro
+aparelho da conta — por PR nosso ou de outra pessoa. **Vale propor ao
+upstream**: o #47 (o `<reject>` de outro aparelho da conta não encerra a
+chamada de entrada) é do mesmo assunto, e os dois juntos fecham o ciclo de vida
+da chamada de entrada num aparelho conectado.
+
 ## Por que não adotamos o hypermeow
 
 Desde 06/09/2026 o meowcaller importa o hypermeow — um fork do whatsmeow, do
@@ -153,9 +223,9 @@ a pseudo-versão que o CRM pina só resolve enquanto o commit for alcançável p
 alguma branch ou tag, e o CRM em produção pode estar pinado no topo antigo.
 
 Entre uma regeneração e outra, um PR novo pode entrar como commit comum no topo
-da `whatsmeow-base` (push normal, sem `-f`) — foi assim que o #26 e o #43
-entraram em 12/10/2026 —, desde que o patch correspondente vá junto para
-`patches-lugwave/` na `main`.
+da `whatsmeow-base` (push normal, sem `-f`) — foi assim que o #26, o #43 e o
+patch nosso do encerrar local entraram em 12/10/2026 —, desde que o patch
+correspondente vá junto para `patches-lugwave/` na `main`.
 
 ## Como o CRM consome
 
