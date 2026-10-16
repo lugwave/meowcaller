@@ -171,7 +171,7 @@ func (e *engine) install() {
 		// whatsmeow recovers handler panics too, but it does so around the
 		// whole handler list: a panic here would skip every handler the host
 		// registered after this one, for this event.
-		defer e.recoverHandler(fmt.Sprintf("event %T", evt), nil)
+		defer e.recoverEvent(evt)
 		switch ev := evt.(type) {
 		case *events.CallOffer:
 			e.onOffer(ev)
@@ -623,33 +623,45 @@ func (e *engine) onOffer(ev *events.CallOffer) {
 	})
 	call := &Call{eng: e, id: ev.CallID, peer: peer, phase: CallPhaseRinging}
 
+	// Everything read from the stanza is parsed BEFORE taking e.mu: a panic in
+	// a parser must never leave the engine lock held (see panic_guard.go).
+	selfLID := e.c.wa.Store.GetLID()
+	// A <video> child marks a call that starts with both video directions enabled.
+	isVideo := signaling.OfferHasVideo(ev.Data)
+	peerDevice, hasPeerDevice := inviteDeviceCapability(ev.From, ev.Data)
+	var relay *relayData
+	if r := findRelay(ev.Data); r != nil {
+		relay = parseRelayData(r)
+	}
+	codec, hasCodec := e.voipSettingsCodec(ev.Data, ev.CallID)
+
 	e.mu.Lock()
 	m := e.entry(ev.CallID)
 	m.call = call
 	m.callKey = callKey
-	m.selfLID = e.c.wa.Store.GetLID().String()
+	m.selfLID = selfLID.String()
 	m.peerLID = peer.String()
 	m.creator = ev.CallCreator
 	m.from = ev.From
 	m.direction = CallDirectionIncoming
-	// A <video> child marks a call that starts with both video directions enabled.
-	isVideo := signaling.OfferHasVideo(ev.Data)
 	m.localVideo = isVideo
 	m.remoteVideo = isVideo
 	m.inviteSelfDevice = groupCallDevice{
-		JID: e.c.wa.Store.GetLID(), CapabilityVersion: 1,
+		JID: selfLID, CapabilityVersion: 1,
 		Capability: append([]byte(nil), signaling.CapabilityOffer...),
 	}
-	if device, ok := inviteDeviceCapability(ev.From, ev.Data); ok {
-		m.invitePeerDevice = device
+	if hasPeerDevice {
+		m.invitePeerDevice = peerDevice
 	}
-	if r := findRelay(ev.Data); r != nil {
-		m.relay = parseRelayData(r)
-		if !m.relay.peerJID.IsEmpty() {
-			m.peerLID = m.relay.peerJID.String()
+	if relay != nil {
+		m.relay = relay
+		if !relay.peerJID.IsEmpty() {
+			m.peerLID = relay.peerJID.String()
 		}
 	}
-	e.applyVoipSettingsCodec(m, ev.Data, ev.CallID)
+	if hasCodec {
+		m.codec = codec
+	}
 	e.mu.Unlock()
 	if isVideo {
 		e.c.log.Info().Str("call_id", ev.CallID).Msg("inbound call advertises video")
@@ -896,7 +908,7 @@ func (e *engine) onRelay(callID string, data *waBinary.Node) {
 	e.mu.Unlock()
 	if rekeyPeer != nil {
 		if err := rekeyPeer(peerLID); err != nil {
-			e.c.log.Warn().Err(err).Str("call_id", callID).Str("peer_lid", peerLID).
+			e.c.log.Warn().Err(err).Str("call_id", callID).Str("peer_lid", maskJID(peerLID)).
 				Msg("failed to rekey media to relay-elected peer")
 		} else {
 			e.c.log.Info().Str("call_id", callID).Str("peer_lid", peerLID).
@@ -1024,14 +1036,19 @@ func (e *engine) onAccept(ev *events.CallAccept) {
 		e.maybeStartMedia(ev.CallID)
 		return
 	}
+	// Parsed before e.mu (see panic_guard.go).
+	device, hasDevice := inviteDeviceCapability(ev.From, ev.Data)
+	codec, hasCodec := e.voipSettingsCodec(ev.Data, ev.CallID)
 	e.mu.Lock()
 	var rekeyPeer func(string) error
 	answeringPeer := ev.From.String()
 	if current := e.calls[ev.CallID]; current != nil {
-		if device, ok := inviteDeviceCapability(ev.From, ev.Data); ok {
+		if hasDevice {
 			current.invitePeerDevice = device
 		}
-		e.applyVoipSettingsCodec(current, ev.Data, ev.CallID)
+		if hasCodec {
+			current.codec = codec
+		}
 		if !ev.From.IsEmpty() {
 			current.from = ev.From
 			answeringPeer = preferQualifiedPeer(current.peerLID, ev.From)
@@ -1044,7 +1061,7 @@ func (e *engine) onAccept(ev *events.CallAccept) {
 	e.mu.Unlock()
 	if rekeyPeer != nil {
 		if err := rekeyPeer(answeringPeer); err != nil {
-			e.c.log.Warn().Err(err).Str("call_id", ev.CallID).Str("peer_lid", answeringPeer).Msg("failed to rekey media to answering device")
+			e.c.log.Warn().Err(err).Str("call_id", ev.CallID).Str("peer_lid", maskJID(answeringPeer)).Msg("failed to rekey media to answering device")
 		} else {
 			e.c.log.Info().Str("call_id", ev.CallID).Str("peer_lid", answeringPeer).Msg("rekeyed media to answering device")
 		}
@@ -1179,27 +1196,29 @@ type rlProbe struct {
 	addr      []byte
 }
 
-// applyVoipSettingsCodec finds the <voip_settings> blob under node (an inbound
-// <offer> or an outbound call <ack>), parses it, and records the selected audio
-// codec on the call. Absent or unparseable settings leave the call on MLow. The
-// caller holds e.mu.
-func (e *engine) applyVoipSettingsCodec(m *engineCall, node *waBinary.Node, callID string) {
+// voipSettingsCodec finds the <voip_settings> blob under node (an inbound
+// <offer> or an outbound call <ack>), parses it, and returns the selected audio
+// codec. ok is false when the settings are absent or unparseable, which leaves
+// the call on MLow. It parses network data, so it runs WITHOUT e.mu: a panic in
+// a parser must never leave the engine lock held (see panic_guard.go).
+func (e *engine) voipSettingsCodec(node *waBinary.Node, callID string) (codec AudioCodec, ok bool) {
 	vsNode := findChild(node, "voip_settings")
 	if vsNode == nil {
-		return
+		return codec, false
 	}
 	content, _ := vsNode.Content.([]byte)
 	vs, err := signaling.ParseVoipSettings(content, e.c.log)
 	if err != nil {
 		e.c.log.Debug().Err(err).Str("call_id", callID).Msg("voip_settings parse failed; keeping mlow")
-		return
+		return codec, false
 	}
-	m.codec = selectAudioCodec(vs)
+	codec = selectAudioCodec(vs)
 	e.c.log.Info().
 		Str("call_id", callID).
-		Str("codec", m.codec.String()).
+		Str("codec", codec.String()).
 		Bool("use_mlow_codec_v1", vs.UseMlowCodecV1).
 		Msg("selected audio codec from voip_settings")
+	return codec, true
 }
 
 // onCallAck handles an <ack class="call"> node. For an outbound offer the relay
@@ -1234,11 +1253,14 @@ func (e *engine) onCallAck(ack *waBinary.Node) {
 		return
 	}
 	e.c.log.Info().Str("call_id", callID).Msg("relay allocation arrived in call ack")
-	e.mu.Lock()
-	if m := e.calls[callID]; m != nil {
-		e.applyVoipSettingsCodec(m, ack, callID)
+	// Parsed before e.mu (see panic_guard.go).
+	if codec, ok := e.voipSettingsCodec(ack, callID); ok {
+		e.mu.Lock()
+		if m := e.calls[callID]; m != nil {
+			m.codec = codec
+		}
+		e.mu.Unlock()
 	}
-	e.mu.Unlock()
 	e.onRelay(callID, ack)
 }
 
@@ -1281,14 +1303,16 @@ func (e *engine) onCallRaw(callNode *waBinary.Node) bool {
 		// The deferred <accept> fires on the FIRST mute_v2 only — it arrives right after
 		// the relaylatency/transport. Later mute_v2 nodes are in-call mute-state changes
 		// (e.g. 1→0) and must not re-run the accept path on an already-accepted call.
+		// Parsed before e.mu (see panic_guard.go).
+		muteFrom, muteCreator := callNode.AttrGetter().JID("from"), mv.JID("call-creator")
 		e.mu.Lock()
 		m := e.calls[callID]
 		pending := m != nil && m.acceptPending
 		early := m != nil && !pending && m.direction == CallDirectionIncoming && !m.answered && !m.group
 		if early && !m.earlyMuteSeen {
 			m.earlyMuteSeen = true
-			m.earlyMuteFrom = callNode.AttrGetter().JID("from")
-			m.earlyMuteCreator = mv.JID("call-creator")
+			m.earlyMuteFrom = muteFrom
+			m.earlyMuteCreator = muteCreator
 		}
 		e.mu.Unlock()
 		if m != nil && m.call != nil {
