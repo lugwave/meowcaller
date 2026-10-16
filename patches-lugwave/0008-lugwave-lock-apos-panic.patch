@@ -1,0 +1,487 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Luan Luciano <luanluciano93@gmail.com>
+Date: Fri, 16 Oct 2026 04:19:45 +0000
+Subject: [PATCH] =?UTF-8?q?lugwave:=20o=20lock=20do=20engine=20n=C3=A3o=20?=
+ =?UTF-8?q?fica=20preso=20depois=20de=20um=20panic=20de=20parse,=20a=20gua?=
+ =?UTF-8?q?rda=20n=C3=A3o=20espera=20por=20ele=20para=20sempre=20e=20os=20?=
+ =?UTF-8?q?avisos=20n=C3=A3o=20levam=20o=20n=C3=BAmero?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Patch NOSSO, por cima do 0006 (revisão independente do #3459 do CRM):
+
+- o que vem da rede (voip_settings, capability, relay, atributos do
+  mute_v2) é parseado ANTES de pegar e.mu, no onOffer, no onAccept, no
+  onCallAck e no onCallRaw — antes o parse rodava com o lock seguro e sem
+  defer, e um panic ali deixava o lock preso: o processo sobrevivia ao
+  recover, mas as chamadas daquela conexão (e o despacho de eventos dela)
+  paravam. applyVoipSettingsCodec vira voipSettingsCodec, que só devolve o
+  codec;
+- abortAfterPanic e as guardas dos handlers sondam e.mu com TryLock por até
+  1 s (lockProbeTimeout); sem conseguir, logam em nível erro "engine lock
+  still held after a panic … restart the host process" e seguem — nunca
+  ficam paradas no Lock;
+- o handler de eventos não monta mais fmt.Sprintf por evento: o tipo do
+  evento só é formatado no recover (recoverEvent);
+- os dois avisos com peer_lid (rekey para o peer eleito pelo relay e para
+  o aparelho que atendeu) levam o JID mascarado (maskJID: só os 4 últimos
+  dígitos).
+
+Testes em panic_lock_test.go.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ engine.go          |  86 ++++++++++++++++++++-----------
+ panic_guard.go     |  87 +++++++++++++++++++++++++++++--
+ panic_lock_test.go | 126 +++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 265 insertions(+), 34 deletions(-)
+ create mode 100644 panic_lock_test.go
+
+diff --git a/engine.go b/engine.go
+index 7ca52b7..97b418b 100644
+--- a/engine.go
++++ b/engine.go
+@@ -171,7 +171,7 @@ func (e *engine) install() {
+ 		// whatsmeow recovers handler panics too, but it does so around the
+ 		// whole handler list: a panic here would skip every handler the host
+ 		// registered after this one, for this event.
+-		defer e.recoverHandler(fmt.Sprintf("event %T", evt), nil)
++		defer e.recoverEvent(evt)
+ 		switch ev := evt.(type) {
+ 		case *events.CallOffer:
+ 			e.onOffer(ev)
+@@ -623,33 +623,45 @@ func (e *engine) onOffer(ev *events.CallOffer) {
+ 	})
+ 	call := &Call{eng: e, id: ev.CallID, peer: peer, phase: CallPhaseRinging}
+ 
++	// Everything read from the stanza is parsed BEFORE taking e.mu: a panic in
++	// a parser must never leave the engine lock held (see panic_guard.go).
++	selfLID := e.c.wa.Store.GetLID()
++	// A <video> child marks a call that starts with both video directions enabled.
++	isVideo := signaling.OfferHasVideo(ev.Data)
++	peerDevice, hasPeerDevice := inviteDeviceCapability(ev.From, ev.Data)
++	var relay *relayData
++	if r := findRelay(ev.Data); r != nil {
++		relay = parseRelayData(r)
++	}
++	codec, hasCodec := e.voipSettingsCodec(ev.Data, ev.CallID)
++
+ 	e.mu.Lock()
+ 	m := e.entry(ev.CallID)
+ 	m.call = call
+ 	m.callKey = callKey
+-	m.selfLID = e.c.wa.Store.GetLID().String()
++	m.selfLID = selfLID.String()
+ 	m.peerLID = peer.String()
+ 	m.creator = ev.CallCreator
+ 	m.from = ev.From
+ 	m.direction = CallDirectionIncoming
+-	// A <video> child marks a call that starts with both video directions enabled.
+-	isVideo := signaling.OfferHasVideo(ev.Data)
+ 	m.localVideo = isVideo
+ 	m.remoteVideo = isVideo
+ 	m.inviteSelfDevice = groupCallDevice{
+-		JID: e.c.wa.Store.GetLID(), CapabilityVersion: 1,
++		JID: selfLID, CapabilityVersion: 1,
+ 		Capability: append([]byte(nil), signaling.CapabilityOffer...),
+ 	}
+-	if device, ok := inviteDeviceCapability(ev.From, ev.Data); ok {
+-		m.invitePeerDevice = device
++	if hasPeerDevice {
++		m.invitePeerDevice = peerDevice
+ 	}
+-	if r := findRelay(ev.Data); r != nil {
+-		m.relay = parseRelayData(r)
+-		if !m.relay.peerJID.IsEmpty() {
+-			m.peerLID = m.relay.peerJID.String()
++	if relay != nil {
++		m.relay = relay
++		if !relay.peerJID.IsEmpty() {
++			m.peerLID = relay.peerJID.String()
+ 		}
+ 	}
+-	e.applyVoipSettingsCodec(m, ev.Data, ev.CallID)
++	if hasCodec {
++		m.codec = codec
++	}
+ 	e.mu.Unlock()
+ 	if isVideo {
+ 		e.c.log.Info().Str("call_id", ev.CallID).Msg("inbound call advertises video")
+@@ -896,7 +908,7 @@ func (e *engine) onRelay(callID string, data *waBinary.Node) {
+ 	e.mu.Unlock()
+ 	if rekeyPeer != nil {
+ 		if err := rekeyPeer(peerLID); err != nil {
+-			e.c.log.Warn().Err(err).Str("call_id", callID).Str("peer_lid", peerLID).
++			e.c.log.Warn().Err(err).Str("call_id", callID).Str("peer_lid", maskJID(peerLID)).
+ 				Msg("failed to rekey media to relay-elected peer")
+ 		} else {
+ 			e.c.log.Info().Str("call_id", callID).Str("peer_lid", peerLID).
+@@ -1024,14 +1036,19 @@ func (e *engine) onAccept(ev *events.CallAccept) {
+ 		e.maybeStartMedia(ev.CallID)
+ 		return
+ 	}
++	// Parsed before e.mu (see panic_guard.go).
++	device, hasDevice := inviteDeviceCapability(ev.From, ev.Data)
++	codec, hasCodec := e.voipSettingsCodec(ev.Data, ev.CallID)
+ 	e.mu.Lock()
+ 	var rekeyPeer func(string) error
+ 	answeringPeer := ev.From.String()
+ 	if current := e.calls[ev.CallID]; current != nil {
+-		if device, ok := inviteDeviceCapability(ev.From, ev.Data); ok {
++		if hasDevice {
+ 			current.invitePeerDevice = device
+ 		}
+-		e.applyVoipSettingsCodec(current, ev.Data, ev.CallID)
++		if hasCodec {
++			current.codec = codec
++		}
+ 		if !ev.From.IsEmpty() {
+ 			current.from = ev.From
+ 			answeringPeer = preferQualifiedPeer(current.peerLID, ev.From)
+@@ -1044,7 +1061,7 @@ func (e *engine) onAccept(ev *events.CallAccept) {
+ 	e.mu.Unlock()
+ 	if rekeyPeer != nil {
+ 		if err := rekeyPeer(answeringPeer); err != nil {
+-			e.c.log.Warn().Err(err).Str("call_id", ev.CallID).Str("peer_lid", answeringPeer).Msg("failed to rekey media to answering device")
++			e.c.log.Warn().Err(err).Str("call_id", ev.CallID).Str("peer_lid", maskJID(answeringPeer)).Msg("failed to rekey media to answering device")
+ 		} else {
+ 			e.c.log.Info().Str("call_id", ev.CallID).Str("peer_lid", answeringPeer).Msg("rekeyed media to answering device")
+ 		}
+@@ -1179,27 +1196,29 @@ type rlProbe struct {
+ 	addr      []byte
+ }
+ 
+-// applyVoipSettingsCodec finds the <voip_settings> blob under node (an inbound
+-// <offer> or an outbound call <ack>), parses it, and records the selected audio
+-// codec on the call. Absent or unparseable settings leave the call on MLow. The
+-// caller holds e.mu.
+-func (e *engine) applyVoipSettingsCodec(m *engineCall, node *waBinary.Node, callID string) {
++// voipSettingsCodec finds the <voip_settings> blob under node (an inbound
++// <offer> or an outbound call <ack>), parses it, and returns the selected audio
++// codec. ok is false when the settings are absent or unparseable, which leaves
++// the call on MLow. It parses network data, so it runs WITHOUT e.mu: a panic in
++// a parser must never leave the engine lock held (see panic_guard.go).
++func (e *engine) voipSettingsCodec(node *waBinary.Node, callID string) (codec AudioCodec, ok bool) {
+ 	vsNode := findChild(node, "voip_settings")
+ 	if vsNode == nil {
+-		return
++		return codec, false
+ 	}
+ 	content, _ := vsNode.Content.([]byte)
+ 	vs, err := signaling.ParseVoipSettings(content, e.c.log)
+ 	if err != nil {
+ 		e.c.log.Debug().Err(err).Str("call_id", callID).Msg("voip_settings parse failed; keeping mlow")
+-		return
++		return codec, false
+ 	}
+-	m.codec = selectAudioCodec(vs)
++	codec = selectAudioCodec(vs)
+ 	e.c.log.Info().
+ 		Str("call_id", callID).
+-		Str("codec", m.codec.String()).
++		Str("codec", codec.String()).
+ 		Bool("use_mlow_codec_v1", vs.UseMlowCodecV1).
+ 		Msg("selected audio codec from voip_settings")
++	return codec, true
+ }
+ 
+ // onCallAck handles an <ack class="call"> node. For an outbound offer the relay
+@@ -1234,11 +1253,14 @@ func (e *engine) onCallAck(ack *waBinary.Node) {
+ 		return
+ 	}
+ 	e.c.log.Info().Str("call_id", callID).Msg("relay allocation arrived in call ack")
+-	e.mu.Lock()
+-	if m := e.calls[callID]; m != nil {
+-		e.applyVoipSettingsCodec(m, ack, callID)
++	// Parsed before e.mu (see panic_guard.go).
++	if codec, ok := e.voipSettingsCodec(ack, callID); ok {
++		e.mu.Lock()
++		if m := e.calls[callID]; m != nil {
++			m.codec = codec
++		}
++		e.mu.Unlock()
+ 	}
+-	e.mu.Unlock()
+ 	e.onRelay(callID, ack)
+ }
+ 
+@@ -1281,14 +1303,16 @@ func (e *engine) onCallRaw(callNode *waBinary.Node) bool {
+ 		// The deferred <accept> fires on the FIRST mute_v2 only — it arrives right after
+ 		// the relaylatency/transport. Later mute_v2 nodes are in-call mute-state changes
+ 		// (e.g. 1→0) and must not re-run the accept path on an already-accepted call.
++		// Parsed before e.mu (see panic_guard.go).
++		muteFrom, muteCreator := callNode.AttrGetter().JID("from"), mv.JID("call-creator")
+ 		e.mu.Lock()
+ 		m := e.calls[callID]
+ 		pending := m != nil && m.acceptPending
+ 		early := m != nil && !pending && m.direction == CallDirectionIncoming && !m.answered && !m.group
+ 		if early && !m.earlyMuteSeen {
+ 			m.earlyMuteSeen = true
+-			m.earlyMuteFrom = callNode.AttrGetter().JID("from")
+-			m.earlyMuteCreator = mv.JID("call-creator")
++			m.earlyMuteFrom = muteFrom
++			m.earlyMuteCreator = muteCreator
+ 		}
+ 		e.mu.Unlock()
+ 		if m != nil && m.call != nil {
+diff --git a/panic_guard.go b/panic_guard.go
+index 8575817..ec81a19 100644
+--- a/panic_guard.go
++++ b/panic_guard.go
+@@ -4,6 +4,9 @@ import (
+ 	"context"
+ 	"fmt"
+ 	"runtime/debug"
++	"strings"
++	"sync/atomic"
++	"time"
+ 
+ 	"github.com/purpshell/meowcaller/signaling"
+ 	waBinary "go.mau.fi/whatsmeow/binary"
+@@ -42,9 +45,9 @@ func (e *engine) recoverMedia(where, callID string) {
+ 	go e.abortAfterPanic(callID)
+ }
+ 
+-// recoverHandler is deferred around the library's whatsmeow hooks (event
+-// handler and node handlers). It reports whether a panic was recovered, so a
+-// node handler can fall back to whatsmeow's own handling.
++// recoverHandler is deferred around the library's whatsmeow node handlers. It
++// reports whether a panic was recovered, so a node handler can fall back to
++// whatsmeow's own handling.
+ func (e *engine) recoverHandler(where string, panicked *bool) {
+ 	r := recover()
+ 	if r == nil {
+@@ -53,11 +56,65 @@ func (e *engine) recoverHandler(where string, panicked *bool) {
+ 	if panicked != nil {
+ 		*panicked = true
+ 	}
++	e.logRecovered(where, r)
++}
++
++// recoverEvent is recoverHandler for the event handler. The event's type is
++// only formatted when there was a panic — not on every event.
++func (e *engine) recoverEvent(evt any) {
++	r := recover()
++	if r == nil {
++		return
++	}
++	e.logRecovered(fmt.Sprintf("event %T", evt), r)
++}
++
++func (e *engine) logRecovered(where string, r any) {
+ 	e.c.log.Error().
+ 		Str("where", where).
+ 		Str("panic", fmt.Sprint(r)).
+ 		Str("stack", string(debug.Stack())).
+ 		Msg("panic in call signaling handler recovered")
++	// The handler may have panicked holding e.mu. Checked off the whatsmeow
++	// goroutine: the probe waits up to lockProbeTimeout.
++	go func() {
++		if !e.engineLockFree() {
++			e.logStuckLock(where)
++		}
++	}()
++}
++
++// lockProbeTimeout is how long the guards wait for e.mu after a panic before
++// declaring it stuck (a time.Duration). Atomic so the tests can shorten it
++// while a probe from an earlier test may still be running.
++var lockProbeTimeout atomic.Int64
++
++func init() { lockProbeTimeout.Store(int64(time.Second)) }
++
++// engineLockFree reports whether e.mu can be taken within lockProbeTimeout.
++// A goroutine that panicked while holding it leaves it held forever (most
++// lock sections unlock without defer); the guards must find that out instead
++// of blocking on it for good. Every section that parses network data does so
++// before taking e.mu, so this should not happen — the probe is the backstop.
++func (e *engine) engineLockFree() bool {
++	deadline := time.Now().Add(time.Duration(lockProbeTimeout.Load()))
++	for {
++		if e.mu.TryLock() {
++			e.mu.Unlock()
++			return true
++		}
++		if time.Now().After(deadline) {
++			return false
++		}
++		time.Sleep(10 * time.Millisecond)
++	}
++}
++
++func (e *engine) logStuckLock(where string) {
++	e.c.log.Error().
++		Str("where", where).
++		Dur("waited", time.Duration(lockProbeTimeout.Load())).
++		Msg("engine lock still held after a panic: calls on this client are stuck — restart the host process (lock do engine preso após panic — reinicie a API)")
+ }
+ 
+ // abortAfterPanic ends a call whose media died with a panic.
+@@ -76,6 +133,12 @@ func (e *engine) abortAfterPanic(callID string) {
+ 				Msg("panic while ending a call after a media panic")
+ 		}
+ 	}()
++	// The goroutine that panicked may hold e.mu: probe it instead of blocking
++	// on it forever (the call then stays as it is, and the log says why).
++	if !e.engineLockFree() {
++		e.logStuckLock("media " + callID)
++		return
++	}
+ 	e.mu.Lock()
+ 	m := e.calls[callID]
+ 	var call *Call
+@@ -129,3 +192,21 @@ func (e *engine) onCallRawGuarded(node *waBinary.Node) (handled bool) {
+ 	defer e.recoverHandler("call node", &panicked)
+ 	return e.onCallRaw(node)
+ }
++
++// maskJID keeps only the last four characters of a JID's user part, so a log
++// line at warning level identifies the device without carrying the number.
++// "5511988887777@s.whatsapp.net" → "…7777@s.whatsapp.net".
++func maskJID(jid string) string {
++	user, server, found := strings.Cut(jid, "@")
++	device := ""
++	if i := strings.IndexAny(user, ":."); i >= 0 {
++		user, device = user[:i], user[i:]
++	}
++	if len(user) > 4 {
++		user = "…" + user[len(user)-4:]
++	}
++	if !found {
++		return user + device
++	}
++	return user + device + "@" + server
++}
+diff --git a/panic_lock_test.go b/panic_lock_test.go
+new file mode 100644
+index 0000000..f7b3316
+--- /dev/null
++++ b/panic_lock_test.go
+@@ -0,0 +1,126 @@
++package meowcaller
++
++import (
++	"bytes"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/rs/zerolog"
++	"go.mau.fi/whatsmeow/types/events"
++)
++
++// lockedBuffer is a log sink safe across the goroutines the guards spawn.
++type lockedBuffer struct {
++	mu  sync.Mutex
++	buf bytes.Buffer
++}
++
++func (b *lockedBuffer) Write(p []byte) (int, error) {
++	b.mu.Lock()
++	defer b.mu.Unlock()
++	return b.buf.Write(p)
++}
++
++func (b *lockedBuffer) String() string {
++	b.mu.Lock()
++	defer b.mu.Unlock()
++	return b.buf.String()
++}
++
++func shortLockProbe(t *testing.T) {
++	t.Helper()
++	old := lockProbeTimeout.Swap(int64(50 * time.Millisecond))
++	t.Cleanup(func() { lockProbeTimeout.Store(old) })
++}
++
++// A media goroutine that panicked while holding e.mu leaves it held. The guard
++// must not block on it forever: it gives up after the probe, says so at error
++// level, and leaves the call as it is.
++func TestAbortAfterPanicWithTheEngineLockStuckGivesUp(t *testing.T) {
++	shortLockProbe(t)
++	eng, call, _ := testEngineWithIncomingCall()
++	logs := &lockedBuffer{}
++	eng.c.log = zerolog.New(logs)
++
++	eng.mu.Lock() // the goroutine that "panicked" never unlocked
++	done := make(chan struct{})
++	go func() {
++		eng.abortAfterPanic("CID")
++		close(done)
++	}()
++	select {
++	case <-done:
++	case <-time.After(2 * time.Second):
++		t.Fatal("abortAfterPanic blocked on a stuck engine lock")
++	}
++	eng.mu.Unlock()
++
++	if !strings.Contains(logs.String(), "engine lock still held after a panic") {
++		t.Fatalf("the stuck lock was not reported: %s", logs.String())
++	}
++	if call.State() != CallPhaseRinging {
++		t.Fatalf("phase = %d; with the lock stuck the call is left as it is", call.State())
++	}
++}
++
++// The handler guards probe the lock too, off the whatsmeow goroutine.
++func TestHandlerPanicWithTheEngineLockStuckIsReported(t *testing.T) {
++	shortLockProbe(t)
++	eng, _, _ := testEngineWithIncomingCall()
++	logs := &lockedBuffer{}
++	eng.c.log = zerolog.New(logs)
++
++	eng.mu.Lock()
++	func() {
++		defer eng.recoverEvent(&events.CallOffer{})
++		panic("parser blew up while holding e.mu")
++	}()
++	deadline := time.Now().Add(2 * time.Second)
++	for !strings.Contains(logs.String(), "engine lock still held") {
++		if time.Now().After(deadline) {
++			t.Fatalf("the stuck lock was not reported: %s", logs.String())
++		}
++		time.Sleep(10 * time.Millisecond)
++	}
++	eng.mu.Unlock()
++	if !strings.Contains(logs.String(), "event *events.CallOffer") {
++		t.Fatalf("the event type was not in the panic report: %s", logs.String())
++	}
++}
++
++// With the lock free the probe stays quiet.
++func TestHandlerPanicWithTheEngineLockFreeReportsOnlyThePanic(t *testing.T) {
++	shortLockProbe(t)
++	eng, _, _ := testEngineWithIncomingCall()
++	logs := &lockedBuffer{}
++	eng.c.log = zerolog.New(logs)
++
++	func() {
++		defer eng.recoverEvent(&events.CallOffer{})
++		panic("boom")
++	}()
++	time.Sleep(150 * time.Millisecond)
++	if strings.Contains(logs.String(), "engine lock still held") {
++		t.Fatalf("a free lock was reported as stuck: %s", logs.String())
++	}
++	if !strings.Contains(logs.String(), "panic in call signaling handler recovered") {
++		t.Fatalf("the panic was not logged: %s", logs.String())
++	}
++}
++
++func TestMaskJID(t *testing.T) {
++	for in, want := range map[string]string{
++		"5511988887777@s.whatsapp.net":     "…7777@s.whatsapp.net",
++		"222222222222222@lid":              "…2222@lid",
++		"222222222222222:7@lid":            "…2222:7@lid",
++		"5511988887777.0:3@s.whatsapp.net": "…7777.0:3@s.whatsapp.net",
++		"123@lid":                          "123@lid",
++		"":                                 "",
++	} {
++		if got := maskJID(in); got != want {
++			t.Errorf("maskJID(%q) = %q, want %q", in, got, want)
++		}
++	}
++}

@@ -17,8 +17,9 @@ o `main` do upstream com **três camadas** por cima, cada uma em commits própri
    consertos abertos no upstream, ainda não mergeados, sem os quais a chamada de
    voz não tem áudio de entrada no nosso uso. **Aqui a lógica muda.**
 3. **Patches nossos** (um commit cada): o encerrar só local (desde
-   12/10/2026), o `recover()` nas goroutines e nos ganchos da lib e os testes
-   do código de vários relays (desde 16/10/2026). Não são PRs do upstream — é
+   12/10/2026), o `recover()` nas goroutines e nos ganchos da lib, os testes
+   do código de vários relays e o lock que não fica preso depois de um panic
+   (desde 16/10/2026). Não são PRs do upstream — é
    lógica escrita por nós, pequena, e a intenção é propô-la lá. **Aqui a
    lógica também muda.**
 
@@ -167,9 +168,10 @@ a medição e os riscos.
 | 3 | Encerrar só local (`Call.EndLocal`) e o `<accept>` de outro aparelho da conta encerra a chamada de entrada | Lugwave | `0003-lugwave-encerrar-local.patch` |
 | 6 | `recover()` nas goroutines de mídia e nos ganchos do whatsmeow | Lugwave | `0006-lugwave-recover.patch` |
 | 7 | Testes do código de vários relays: fanout, filtro de replay e filtro de `relaylatency` | Lugwave | `0007-lugwave-testes-relays.patch` |
+| 8 | O lock do engine não fica preso depois de um panic de parse; a guarda não espera por ele para sempre; avisos sem o número | Lugwave | `0008-lugwave-lock-apos-panic.patch` |
 
-As seções abaixo até "Por que não adotamos o hypermeow" são do 0003; o 0006 e o
-0007 estão nas duas seções seguintes a ele.
+As seções abaixo até "Por que não adotamos o hypermeow" são do 0003; o 0006, o
+0007 e o 0008 estão nas seções seguintes a ele.
 
 Aplica depois dos dois PRs (mexe no `engine.onAccept` e no `livecall.go`, que
 eles não tocam nesses pontos).
@@ -259,13 +261,21 @@ O que muda (`panic_guard.go`, e um `defer` em cada ponto):
 - o handler de eventos da lib recupera o próprio panic: sem isso, o recover do
   whatsmeow pularia os handlers que o hospedeiro registrou depois do dela.
 
-**Riscos conhecidos:** um panic com o lock do engine seguro deixa o lock preso
-— o processo sobrevive, mas as chamadas daquela conexão param (e, como o
-handler de eventos da lib espera o lock, o despacho de eventos daquela
-conexão também). É pior para aquela conexão e melhor para todas as outras.
-Os testes (`panic_guard_test.go`) provocam panics de verdade (escrita em mapa
-nil, ponteiro nil) nas guardas; não há como provocar um panic dentro do
-`runMedia` sem relay de verdade.
+**O que o 0006 NÃO cobre:** as goroutines que o **pion** sobe por dentro (DTLS,
+SCTP, DataChannel — o laço de leitura do `dtls.Conn`, os temporizadores e o
+`readLoop` da associação SCTP). Elas não são da lib, e um panic numa delas
+ainda derruba o processo. O que a lib protege é a chamada ao pion
+(`relay.ConnectRelayMedia` e o `Recv` de cada relay), não o que o pion faz em
+goroutine própria.
+
+**Riscos conhecidos:** um panic com o lock do engine seguro deixaria o lock
+preso — o processo sobrevive, mas as chamadas daquela conexão param (e, como o
+handler de eventos da lib espera o lock, o despacho de eventos daquela conexão
+também). O 0008 tira desse caminho o que pode dar panic (o parse de dado da
+rede) e faz as guardas sondarem o lock em vez de esperarem por ele. Os testes
+(`panic_guard_test.go`) provocam panics de verdade (escrita em mapa nil,
+ponteiro nil) nas guardas; não há como provocar um panic dentro do `runMedia`
+sem relay de verdade.
 
 **Critério de saída:** quando o upstream tiver recover equivalente.
 
@@ -293,6 +303,27 @@ A única linha de código fora de teste: o `onRelayLatency` passa a enviar pelo
 verdade, são exatamente o `SendNode`/`GenerateMessageID` de antes — para o
 teste ver o que foi respondido. **O que estes testes não dizem:** que os relays
 do WhatsApp nos aceitam; isso continua sendo só chamada real.
+
+## 0008 — o lock do engine depois de um panic
+
+Por cima do 0006, da revisão independente do CRM:
+
+- o que vem da rede — `voip_settings`, `capability`, `<relay>`, atributos do
+  `mute_v2` — é parseado **antes** de pegar `e.mu` no `onOffer`, `onAccept`,
+  `onCallAck` e `onCallRaw`. Era parseado com o lock seguro e sem `defer`: um
+  panic ali deixava o lock preso para sempre. (`applyVoipSettingsCodec` vira
+  `voipSettingsCodec`, que só devolve o codec.) Os trechos de grupo não foram
+  revistos um a um — o CRM recusa oferta de grupo no portão;
+- `abortAfterPanic` e as guardas dos handlers sondam `e.mu` com `TryLock` por
+  até 1 s; sem conseguir, logam em nível erro `engine lock still held after a
+  panic … restart the host process` e seguem, em vez de ficar paradas no
+  `Lock`;
+- o handler de eventos só formata o tipo do evento no recover, não a cada
+  evento;
+- os dois avisos de rekey levam o `peer_lid` mascarado (`maskJID`, só os 4
+  últimos dígitos) — aviso sai no log de produção de quem hospeda a lib.
+
+Testes em `panic_lock_test.go`.
 
 ## Por que não adotamos o hypermeow
 
@@ -339,7 +370,8 @@ As tags são `lugwave-v0.0.N`, uma por topo que o CRM pinou, em ordem:
 | --- | --- | --- |
 | `lugwave-v0.0.1` | `a57027d` | produção desde a 1.50.18 (#26 e #43) |
 | `lugwave-v0.0.2` | `101663a` | rascunhos #3366/#3367 do CRM (+ encerrar local) |
-| `lugwave-v0.0.3` | o topo de 16/10/2026 | #3365 (+ #46, #47, recover e testes) |
+| `lugwave-v0.0.3` | `26f53bf` | primeira versão do #3459 do CRM (+ #46, #47, recover e testes) |
+| `lugwave-v0.0.4` | o topo seguinte de 16/10/2026 | #3459 do CRM depois da revisão (+ 0008) |
 
 O prefixo `lugwave-` é de propósito: não é uma versão semver do módulo para o
 Go, então a tag só segura o commit e não muda como o CRM o referencia (segue
