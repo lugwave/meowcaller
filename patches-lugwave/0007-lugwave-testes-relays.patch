@@ -1,0 +1,514 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Luan Luciano <luanluciano93@gmail.com>
+Date: Fri, 16 Oct 2026 03:01:37 +0000
+Subject: [PATCH] =?UTF-8?q?lugwave:=20testes=20do=20c=C3=B3digo=20de=20v?=
+ =?UTF-8?q?=C3=A1rios=20relays=20=E2=80=94=20fanout=20contra=20relays=20lo?=
+ =?UTF-8?q?cais,=20filtro=20de=20replay=20e=20filtro=20de=20relaylatency?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Patch NOSSO. O #26 trouxe três peças que a lib marca "NOT VALIDATED:
+live-relay only". relay_fanout_test.go testa as três:
+
+- fanout, contra relays LOCAIS que falam a mesma pilha de transporte (UDP,
+  DTLS, SCTP, DataChannel pré-negociado — relay.ConnectRelayMedia de
+  verdade): o envio vai a todos, o allocate de cada relay só a ele, o envio
+  de grupo só ao primeiro, a entrada de todos é juntada, um relay que cai
+  não derruba a chamada e o último fecha o fanout; connectAndAllocateAll
+  liga cada endpoint distinto da oferta (FNA primeiro na entrada), pula o
+  duplicado e o sem token, e cada relay recebe o allocate com o token dele;
+- filtro de replay (SSRC, seq): cópias, outro SSRC, colisão de slot no anel
+  de 1024 e a volta do seq;
+- filtro de relaylatency: só se responde relay da oferta; sem oferta,
+  responde-se tudo; chamada de saída não responde.
+
+Única mudança fora de teste: onRelayLatency envia pelo
+nextCallNodeID/transmitCallNode do engine — com um whatsmeow de verdade, os
+mesmos GenerateMessageID/SendNode de antes — para o teste ver o que saiu.
+
+O que estes testes NÃO dizem: que os relays do WhatsApp nos aceitam.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ engine.go            |   7 +-
+ relay_fanout_test.go | 452 +++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 457 insertions(+), 2 deletions(-)
+ create mode 100644 relay_fanout_test.go
+
+diff --git a/engine.go b/engine.go
+index bfa0640..7ca52b7 100644
+--- a/engine.go
++++ b/engine.go
+@@ -960,8 +960,11 @@ func (e *engine) onRelayLatency(ev *events.CallRelayLatency) {
+ 			RelayName:    p.relayName,
+ 			AddressBytes: p.addr,
+ 		})
+-		resp.Attrs["id"] = e.c.wa.GenerateMessageID()
+-		if err := e.c.wa.DangerousInternals().SendNode(context.Background(), resp); err != nil {
++		// The same whatsmeow calls as before (nextCallNodeID and
++		// transmitCallNode wrap GenerateMessageID and SendNode), through the
++		// engine's seam so a test can see what is answered.
++		resp.Attrs["id"] = e.nextCallNodeID()
++		if err := e.transmitCallNode(context.Background(), resp); err != nil {
+ 			e.c.log.Error().Err(err).Str("call_id", ev.CallID).Msg("send relaylatency failed")
+ 			return
+ 		}
+diff --git a/relay_fanout_test.go b/relay_fanout_test.go
+new file mode 100644
+index 0000000..3dc0b96
+--- /dev/null
++++ b/relay_fanout_test.go
+@@ -0,0 +1,452 @@
++package meowcaller
++
++import (
++	"bytes"
++	"context"
++	"net"
++	"sort"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/pion/datachannel"
++	"github.com/pion/dtls/v3"
++	"github.com/pion/dtls/v3/pkg/crypto/selfsign"
++	"github.com/pion/logging"
++	"github.com/pion/sctp"
++	"github.com/purpshell/meowcaller/relay"
++	waBinary "go.mau.fi/whatsmeow/binary"
++	"go.mau.fi/whatsmeow/types"
++	"go.mau.fi/whatsmeow/types/events"
++)
++
++// Tests for the bind-to-all relay code (upstream PR #26): the fanout across
++// every offered relay, the RTP replay filter that merges their duplicates, and
++// the relaylatency filter. The fanout runs over the library's real transport
++// stack (relay.ConnectRelayMedia: UDP, DTLS, SCTP, pre-negotiated DataChannel)
++// against local relays speaking the same stack — not WhatsApp's relays, so
++// nothing here says the relays accept us; it says what the library does with
++// several of them.
++
++// fakeRelay is a local endpoint of the relay transport: it accepts one DTLS
++// client, runs SCTP over it and opens the pre-negotiated DataChannel id 0.
++type fakeRelay struct {
++	t     *testing.T
++	addr  *net.UDPAddr
++	ln    net.Listener
++	ready chan struct{}
++	got   chan []byte
++
++	mu    sync.Mutex
++	conn  net.Conn
++	assoc *sctp.Association
++	dc    *datachannel.DataChannel
++}
++
++func startFakeRelay(t *testing.T) *fakeRelay {
++	t.Helper()
++	cert, err := selfsign.GenerateSelfSignedWithDNS("fake-relay")
++	if err != nil {
++		t.Fatalf("relay cert: %v", err)
++	}
++	ln, err := dtls.ListenWithOptions("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)}, dtls.WithCertificates(cert))
++	if err != nil {
++		t.Fatalf("relay listen: %v", err)
++	}
++	r := &fakeRelay{
++		t: t, ln: ln, addr: ln.Addr().(*net.UDPAddr),
++		ready: make(chan struct{}), got: make(chan []byte, 64),
++	}
++	go r.serve()
++	t.Cleanup(r.stop)
++	return r
++}
++
++func (r *fakeRelay) serve() {
++	conn, err := r.ln.Accept()
++	if err != nil {
++		return
++	}
++	lf := logging.NewDefaultLoggerFactory()
++	lf.DefaultLogLevel = logging.LogLevelDisabled
++	assoc, err := sctp.ServerWithOptions(sctp.WithNetConn(conn), sctp.WithLoggerFactory(lf), sctp.WithName("fake-relay"))
++	if err != nil {
++		_ = conn.Close()
++		return
++	}
++	dc, err := datachannel.Dial(assoc, 0, &datachannel.Config{
++		Negotiated: true, Label: relay.DataChannelLabel, LoggerFactory: lf,
++	})
++	if err != nil {
++		_ = conn.Close()
++		return
++	}
++	r.mu.Lock()
++	r.conn, r.assoc, r.dc = conn, assoc, dc
++	r.mu.Unlock()
++	close(r.ready)
++	buf := make([]byte, 2048)
++	for {
++		n, err := dc.Read(buf)
++		if err != nil {
++			return
++		}
++		r.got <- append([]byte(nil), buf[:n]...)
++	}
++}
++
++// send writes one packet from the relay to the client.
++func (r *fakeRelay) send(pkt []byte) {
++	r.t.Helper()
++	select {
++	case <-r.ready:
++	case <-time.After(5 * time.Second):
++		r.t.Fatal("fake relay never got its DataChannel")
++	}
++	r.mu.Lock()
++	dc := r.dc
++	r.mu.Unlock()
++	if _, err := dc.Write(pkt); err != nil {
++		r.t.Fatalf("fake relay write: %v", err)
++	}
++}
++
++// next returns the next packet the client sent to this relay.
++func (r *fakeRelay) next() []byte {
++	r.t.Helper()
++	select {
++	case p := <-r.got:
++		return p
++	case <-time.After(5 * time.Second):
++		r.t.Fatalf("relay %s got nothing", r.addr)
++		return nil
++	}
++}
++
++// quiet asserts the client sent this relay nothing more.
++func (r *fakeRelay) quiet() {
++	r.t.Helper()
++	select {
++	case p := <-r.got:
++		r.t.Fatalf("relay %s got an unexpected packet %q", r.addr, p)
++	case <-time.After(150 * time.Millisecond):
++	}
++}
++
++// stop drops the relay. The SCTP ABORT is what ends the client's reader
++// deterministically (a DTLS close_notify alone can be lost when the socket
++// closes right behind it).
++func (r *fakeRelay) stop() {
++	r.mu.Lock()
++	conn, assoc := r.conn, r.assoc
++	r.conn, r.assoc = nil, nil
++	r.mu.Unlock()
++	if assoc != nil {
++		assoc.Abort("fake relay down")
++	}
++	if conn != nil {
++		_ = conn.Close()
++	}
++	_ = r.ln.Close()
++}
++
++func dialFakeRelays(t *testing.T, relays ...*fakeRelay) []*relay.RelayMediaChannel {
++	t.Helper()
++	var chans []*relay.RelayMediaChannel
++	for _, r := range relays {
++		ch, err := relay.ConnectRelayMedia(r.addr)
++		if err != nil {
++			t.Fatalf("connect to fake relay %s: %v", r.addr, err)
++		}
++		chans = append(chans, ch)
++	}
++	return chans
++}
++
++func recvWithin(t *testing.T, f *relayFanout, d time.Duration) ([]byte, error) {
++	t.Helper()
++	type res struct {
++		pkt []byte
++		err error
++	}
++	out := make(chan res, 1)
++	go func() {
++		buf := make([]byte, 2048)
++		n, err := f.Recv(buf)
++		out <- res{append([]byte(nil), buf[:n]...), err}
++	}()
++	select {
++	case r := <-out:
++		return r.pkt, r.err
++	case <-time.After(d):
++		t.Fatalf("Recv blocked for %s", d)
++		return nil, nil
++	}
++}
++
++// Outbound media goes to every relay, each relay's allocate goes only to that
++// relay, the primary-only path stays on the first one, and inbound merges from
++// all of them.
++func TestRelayFanoutBroadcastsMergesAndKeepsAllocatesPerRelay(t *testing.T) {
++	a, b, c := startFakeRelay(t), startFakeRelay(t), startFakeRelay(t)
++	allocs := [][]byte{[]byte("alloc-a"), []byte("alloc-b"), []byte("alloc-c")}
++	f := newRelayFanout(dialFakeRelays(t, a, b, c), allocs, []string{"a", "b", "c"})
++	defer f.Close()
++
++	if n, err := f.Send([]byte("rtp-1")); err != nil || n != 5 {
++		t.Fatalf("Send = %d, %v", n, err)
++	}
++	for _, r := range []*fakeRelay{a, b, c} {
++		if got := r.next(); string(got) != "rtp-1" {
++			t.Fatalf("relay %s got %q, want the broadcast", r.addr, got)
++		}
++	}
++
++	if err := f.ResendAllocates(); err != nil {
++		t.Fatalf("ResendAllocates: %v", err)
++	}
++	for i, r := range []*fakeRelay{a, b, c} {
++		if got := r.next(); !bytes.Equal(got, allocs[i]) {
++			t.Fatalf("relay %d got allocate %q, want its own %q", i, got, allocs[i])
++		}
++	}
++
++	if _, err := f.PrimarySend([]byte("group")); err != nil {
++		t.Fatalf("PrimarySend: %v", err)
++	}
++	if got := a.next(); string(got) != "group" {
++		t.Fatalf("primary relay got %q", got)
++	}
++	b.quiet()
++	c.quiet()
++
++	a.send([]byte("from-a"))
++	b.send([]byte("from-b"))
++	c.send([]byte("from-c"))
++	var merged []string
++	for range 3 {
++		pkt, err := recvWithin(t, f, 5*time.Second)
++		if err != nil {
++			t.Fatalf("Recv: %v", err)
++		}
++		merged = append(merged, string(pkt))
++	}
++	sort.Strings(merged)
++	if want := []string{"from-a", "from-b", "from-c"}; !equalStrings(merged, want) {
++		t.Fatalf("merged inbound = %v, want %v", merged, want)
++	}
++}
++
++// One relay dying is survivable: the others keep sending and receiving. The
++// fanout closes only when the last relay is gone, and Recv then fails instead
++// of blocking forever.
++func TestRelayFanoutSurvivesARelayAndClosesWithTheLast(t *testing.T) {
++	a, b := startFakeRelay(t), startFakeRelay(t)
++	f := newRelayFanout(dialFakeRelays(t, a, b), [][]byte{nil, nil}, []string{"a", "b"})
++	defer f.Close()
++	a.send([]byte("hello"))
++	if pkt, err := recvWithin(t, f, 5*time.Second); err != nil || string(pkt) != "hello" {
++		t.Fatalf("Recv = %q, %v", pkt, err)
++	}
++
++	a.stop()
++	b.send([]byte("still-here"))
++	if pkt, err := recvWithin(t, f, 5*time.Second); err != nil || string(pkt) != "still-here" {
++		t.Fatalf("after one relay died: Recv = %q, %v", pkt, err)
++	}
++	if _, err := f.Send([]byte("out")); err != nil {
++		t.Fatalf("after one relay died: Send = %v", err)
++	}
++	if got := b.next(); string(got) != "out" {
++		t.Fatalf("surviving relay got %q", got)
++	}
++
++	b.stop()
++	deadline := time.Now().Add(10 * time.Second)
++	for {
++		_, err := recvWithin(t, f, 11*time.Second)
++		if err == errFanoutClosed {
++			break
++		}
++		if time.Now().After(deadline) {
++			t.Fatalf("the fanout did not close after every relay died (last Recv err %v)", err)
++		}
++	}
++	if _, err := f.Send([]byte("late")); err != errFanoutClosed {
++		t.Fatalf("Send on a closed fanout = %v, want errFanoutClosed", err)
++	}
++}
++
++// connectAndAllocateAll binds every distinct offered endpoint, primary first,
++// skips an endpoint it cannot key (and duplicates), and sends each relay the
++// allocate built with that relay's own token.
++func TestConnectAndAllocateAllBindsEveryOfferedRelay(t *testing.T) {
++	fna, own, noToken := startFakeRelay(t), startFakeRelay(t), startFakeRelay(t)
++	at := func(r *fakeRelay) []relayAddress {
++		return []relayAddress{{ipv4: "127.0.0.1", port: uint16(r.addr.Port)}}
++	}
++	rd := &relayData{
++		relayKeyASCII: []byte("relay-key"),
++		relayTokens:   [][]byte{[]byte("token-0"), []byte("token-1")},
++		endpoints: []relayEndpoint{
++			{relayName: "own", tokenID: 1, authTokenID: 1, addresses: at(own)},
++			{relayName: "fna", tokenID: 0, isFNA: true, addresses: at(fna)},
++			{relayName: "fna-again", tokenID: 0, addresses: at(fna)},
++			{relayName: "no-token", tokenID: 7, addresses: at(noToken)},
++			{relayName: "no-address", tokenID: 0},
++		},
++	}
++	eng, _, _ := testEngineWithIncomingCall()
++	f, err := eng.connectAndAllocateAll(context.Background(), rd, [9]uint32{1, 2, 3}, true, true)
++	if err != nil {
++		t.Fatalf("connectAndAllocateAll: %v", err)
++	}
++	defer f.Close()
++
++	if want := []string{"fna", "own"}; !equalStrings(f.names, want) {
++		t.Fatalf("bound relays = %v, want %v (inbound: the FNA endpoint first)", f.names, want)
++	}
++	if !bytes.Contains(f.allocs[0], []byte("token-0")) || !bytes.Contains(f.allocs[1], []byte("token-1")) {
++		t.Fatal("each relay's allocate must carry that relay's own token")
++	}
++	if got := fna.next(); !bytes.Equal(got, f.allocs[0]) {
++		t.Fatal("the FNA relay did not get its allocate")
++	}
++	if got := own.next(); !bytes.Equal(got, f.allocs[1]) {
++		t.Fatal("the second relay did not get its allocate")
++	}
++	fna.quiet() // the duplicate endpoint was not bound a second time
++	noToken.quiet()
++
++	// multi=false (group calls) keeps the single-relay behavior.
++	single, err := eng.connectAndAllocateAll(context.Background(), &relayData{
++		relayKeyASCII: rd.relayKeyASCII, relayTokens: rd.relayTokens,
++		endpoints: []relayEndpoint{
++			{relayName: "fna", tokenID: 0, isFNA: true, addresses: at(startFakeRelay(t))},
++			{relayName: "own", tokenID: 1, authTokenID: 1, addresses: at(startFakeRelay(t))},
++		},
++	}, [9]uint32{1, 2, 3}, true, false)
++	if err != nil {
++		t.Fatalf("connectAndAllocateAll(multi=false): %v", err)
++	}
++	defer single.Close()
++	if !equalStrings(single.names, []string{"fna"}) {
++		t.Fatalf("multi=false bound %v, want only the primary", single.names)
++	}
++}
++
++// With every relay bridging the same session one packet arrives once per
++// relay: only the first copy of an (SSRC, seq) passes.
++func TestRTPReplayFilter(t *testing.T) {
++	r := newRtpReplayFilter()
++	if r.Duplicate(1, 100) {
++		t.Fatal("first copy marked duplicate")
++	}
++	if !r.Duplicate(1, 100) || !r.Duplicate(1, 100) {
++		t.Fatal("second and third copies (two more relays) must be dropped")
++	}
++	if r.Duplicate(2, 100) {
++		t.Fatal("same seq on another SSRC is another stream")
++	}
++	if r.Duplicate(1, 101) {
++		t.Fatal("next seq marked duplicate")
++	}
++
++	// seq 1124 shares 100's slot in the 1024-slot ring: it is new, and it
++	// evicts 100 — whose late copy, 61 s of audio later, is no longer known.
++	if r.Duplicate(1, 1124) {
++		t.Fatal("a seq sharing a slot with an older one is not a duplicate")
++	}
++	if !r.Duplicate(1, 1124) {
++		t.Fatal("its own second copy is")
++	}
++
++	// Sequence wraparound: 65535 then 0 are both new.
++	if r.Duplicate(3, 65535) || r.Duplicate(3, 0) {
++		t.Fatal("wraparound marked as duplicate")
++	}
++	if !r.Duplicate(3, 0) {
++		t.Fatal("copy after wraparound not dropped")
++	}
++
++	// A first packet with seq 0 on a fresh stream is new (the ring starts with
++	// slot 0 holding seq 0 and its bit clear).
++	if r.Duplicate(4, 0) {
++		t.Fatal("seq 0 on a fresh stream marked duplicate")
++	}
++}
++
++// relaylatency is answered only for relays that are in the offer: echoing the
++// caller's own nearest edge would steer its relay election to a relay we hold
++// no token for.
++func TestRelayLatencyAnswersOnlyOfferedRelays(t *testing.T) {
++	eng, _, _ := testEngineWithIncomingCall()
++	eng.calls["CID"].relay = &relayData{endpoints: []relayEndpoint{{relayName: "gru1"}, {relayName: "gru2"}}}
++	var answered []string
++	eng.sendCallNode = func(_ context.Context, n waBinary.Node) error {
++		answered = append(answered, teRelayNames(&n)...)
++		return nil
++	}
++
++	eng.onRelayLatency(relayLatencyEvent("gru1", "edge-not-offered", "gru2"))
++	if want := []string{"gru1", "gru2"}; !equalStrings(answered, want) {
++		t.Fatalf("answered relays = %v, want %v", answered, want)
++	}
++
++	// Without relay data (none offered yet) nothing is filtered: the
++	// pre-fanout behavior.
++	answered = nil
++	eng.calls["CID"].relay = nil
++	eng.onRelayLatency(relayLatencyEvent("edge-not-offered"))
++	if !equalStrings(answered, []string{"edge-not-offered"}) {
++		t.Fatalf("with no offer to filter by, answered %v", answered)
++	}
++
++	// An outbound call is not answered at all (the callee does that).
++	answered = nil
++	eng.calls["CID"].direction = CallDirectionOutgoing
++	eng.onRelayLatency(relayLatencyEvent("gru1"))
++	if len(answered) != 0 {
++		t.Fatalf("outbound call answered %v", answered)
++	}
++}
++
++func relayLatencyEvent(names ...string) *events.CallRelayLatency {
++	var tes []waBinary.Node
++	for _, name := range names {
++		tes = append(tes, waBinary.Node{
++			Tag:     "te",
++			Attrs:   waBinary.Attrs{"relay_name": name, "latency": "33554442"},
++			Content: []byte{127, 0, 0, 1, 0x0d, 0x96},
++		})
++	}
++	return &events.CallRelayLatency{
++		BasicCallMeta: types.BasicCallMeta{CallID: "CID", From: peerJID(), CallCreator: creatorJID()},
++		// whatsmeow hands the <relaylatency> child itself as Data.
++		Data: &waBinary.Node{Tag: "relaylatency", Attrs: waBinary.Attrs{"call-id": "CID"}, Content: tes},
++	}
++}
++
++// teRelayNames collects relay_name of every <te> under n.
++func teRelayNames(n *waBinary.Node) []string {
++	var out []string
++	if n.Tag == "te" {
++		out = append(out, n.AttrGetter().String("relay_name"))
++	}
++	for _, kid := range n.GetChildren() {
++		out = append(out, teRelayNames(&kid)...)
++	}
++	return out
++}
++
++func equalStrings(a, b []string) bool {
++	if len(a) != len(b) {
++		return false
++	}
++	for i := range a {
++		if a[i] != b[i] {
++			return false
++		}
++	}
++	return true
++}
