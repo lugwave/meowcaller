@@ -1,0 +1,106 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Victor Villalobos <v@wuapi.dev>
+Date: Fri, 16 Oct 2026 02:24:38 +0000
+Subject: [PATCH] =?UTF-8?q?upstream=20#47:=20o=20<reject>=20de=20outro=20a?=
+ =?UTF-8?q?parelho=20da=20pr=C3=B3pria=20conta=20n=C3=A3o=20encerra=20a=20?=
+ =?UTF-8?q?chamada=20de=20entrada?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+PR upstream: https://github.com/purpshell/meowcaller/pull/47
+  "engine: a reject from the account's own device does not end an inbound
+  call"
+Head: 808116a43280d5d0408610be3c4ad47d88fca2bb (base c48c3e2), ABERTO em
+16/10/2026, sem comentário nem revisão. Autor original: Victor Villalobos
+(@viktorvillalobos) — a autoria deste commit é dele; aqui só foi portado.
+
+O que resolve: numa chamada de ENTRADA, o <reject> que chega a este
+aparelho vem de outro aparelho da mesma conta recusando só por si (visto
+pelo autor com reason="unavailable"); quem liga segue chamando os outros
+e encerra com <terminate>. engine.onReject derrubava a chamada com
+qualquer <reject> — a lib largava uma chamada que ainda tocava, e quem a
+hospeda não conseguia mais atendê-la. Agora o reject de entrada é só
+logado; o <terminate> é o que encerra (inclusive o
+reason="rejected_elsewhere" de quando a recusa é da conta inteira). A
+chamada de SAÍDA não muda: o reject ali é o contato recusando.
+
+O port, em relação ao diff do PR (a única diferença): o import de
+github.com/polymorfa/hypermeow reescrito para go.mau.fi/whatsmeow em
+inbound_reject_test.go. Aplicou limpo sobre o #26, o #43, o patch nosso
+do encerrar local e o #46.
+
+Risco (ver LEIA-ME-LUGWAVE.md): se o <terminate> de uma chamada recusada
+por outro aparelho se perder, a mídia segue de pé até quem hospeda a lib
+encerrar — no CRM, a rede de segurança (prazo da linha e varredura).
+
+Este commit CAI quando o upstream mergear o #47: a regeneração da base
+(scripts/regenerar-base-whatsmeow.sh) detecta o patch já presente e para,
+pedindo para tirá-lo de patches-lugwave/.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ engine.go              | 11 +++++++++++
+ inbound_reject_test.go | 31 +++++++++++++++++++++++++++++++
+ 2 files changed, 42 insertions(+)
+ create mode 100644 inbound_reject_test.go
+
+diff --git a/engine.go b/engine.go
+index cb82518..679e13f 100644
+--- a/engine.go
++++ b/engine.go
+@@ -1144,6 +1144,17 @@ func (e *engine) onReject(ev *events.CallReject) {
+ 	if m == nil {
+ 		return
+ 	}
++	// On an inbound call a <reject> comes from another device of this same account
++	// declining for itself (seen live with reason="unavailable"). The call goes on
++	// for the devices that did not decline: the caller keeps sending <transport> and
++	// ends it with <terminate>, which is what tears an inbound call down.
++	if m.direction == CallDirectionIncoming {
++		e.c.log.Info().
++			Str("call_id", ev.CallID).
++			Str("from", ev.From.String()).
++			Msg("another device of this account declined the inbound call; it stays live here")
++		return
++	}
+ 	e.c.log.Info().
+ 		Str("call_id", ev.CallID).
+ 		Str("from", ev.From.String()).
+diff --git a/inbound_reject_test.go b/inbound_reject_test.go
+new file mode 100644
+index 0000000..a1b6ceb
+--- /dev/null
++++ b/inbound_reject_test.go
+@@ -0,0 +1,31 @@
++package meowcaller
++
++import (
++	"testing"
++
++	"go.mau.fi/whatsmeow/types"
++	"go.mau.fi/whatsmeow/types/events"
++)
++
++// A <reject> on an inbound call is another device of the same account declining
++// for itself. The call must stay live on this device until the caller ends it.
++func TestOwnDeviceRejectKeepsInboundCallLive(t *testing.T) {
++	eng, call := testEngineWithOutgoingCall()
++	eng.calls["CID"].direction = CallDirectionIncoming
++	call.phase = CallPhaseRinging
++	var reason string
++	call.OnEnd(func(r string) { reason = r })
++
++	eng.onReject(&events.CallReject{BasicCallMeta: types.BasicCallMeta{CallID: "CID"}})
++	if got := call.State(); got != CallPhaseRinging {
++		t.Fatalf("phase = %d, want still Ringing", got)
++	}
++	if eng.lookup("CID") == nil || reason != "" {
++		t.Fatalf("the call was torn down (reason %q)", reason)
++	}
++
++	eng.onTerminate("CID", "")
++	if got := call.State(); got != CallPhaseEnded {
++		t.Fatalf("phase = %d after terminate, want Ended", got)
++	}
++}

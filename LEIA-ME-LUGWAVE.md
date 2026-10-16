@@ -16,9 +16,11 @@ o `main` do upstream com **três camadas** por cima, cada uma em commits própri
 2. **Os PRs carregados** (um commit por PR, com a autoria de quem escreveu):
    consertos abertos no upstream, ainda não mergeados, sem os quais a chamada de
    voz não tem áudio de entrada no nosso uso. **Aqui a lógica muda.**
-3. **Um patch nosso** (um commit, desde 12/10/2026): o encerrar só local. Não é
-   PR do upstream — é lógica escrita por nós, pequena, e a intenção é propô-la
-   lá. **Aqui a lógica também muda.**
+3. **Patches nossos** (um commit cada): o encerrar só local (desde
+   12/10/2026), o `recover()` nas goroutines e nos ganchos da lib e os testes
+   do código de vários relays (desde 16/10/2026). Não são PRs do upstream — é
+   lógica escrita por nós, pequena, e a intenção é propô-la lá. **Aqui a
+   lógica também muda.**
 
 Até 12/10/2026 este arquivo prometia que o fork "não muda uma linha de lógica".
 **Essa promessa deixou de valer** com a camada 2, e a de que "nada de lógica
@@ -35,13 +37,17 @@ aplicá-los ali só criaria uma segunda cópia para manter.
 ## PRs do upstream carregados
 
 Os patches estão em [`patches-lugwave/`](patches-lugwave), no formato do
-`git format-patch`, já portados para a base whatsmeow. Aplicam nesta ordem (o
-segundo depende do primeiro: os dois mexem na mesma struct).
+`git format-patch`, já portados para a base whatsmeow. Aplicam na ordem do
+número do arquivo, misturados com os nossos (ver a seção seguinte): o 0002
+depende do 0001 (os dois mexem na mesma struct), e o 0004 e o 0005 vêm
+depois do 0003 porque foram aplicados por cima dele.
 
 | # | PR | Título | Head | Autor | Arquivo |
 | --- | --- | --- | --- | --- | --- |
 | 1 | [#26](https://github.com/purpshell/meowcaller/pull/26) | Bind every offered relay so phone callers don't go deaf after accept (fixes #21, #22) | `3494d987fa8d` | @pedrobartolini | `0001-upstream-pr26-relay-fanout.patch` |
 | 2 | [#43](https://github.com/purpshell/meowcaller/pull/43) | engine.go: start inbound media on the offer so a late answer keeps inbound audio | `8b2a046b6396` | @Michsantozz | `0002-upstream-pr43-midia-na-oferta.patch` |
+| 4 | [#46](https://github.com/purpshell/meowcaller/pull/46) | engine: an offer gate and an exported hook check | `931b695258ec` | @viktorvillalobos | `0004-upstream-pr46-portao-por-oferta.patch` |
+| 5 | [#47](https://github.com/purpshell/meowcaller/pull/47) | engine: a reject from the account's own device does not end an inbound call | `808116a43280` | @viktorvillalobos | `0005-upstream-pr47-reject-de-outro-aparelho.patch` |
 
 ### #26 — liga todos os relays da oferta
 
@@ -71,6 +77,42 @@ marca a chamada como ativa.
 O que o port tem de diferente do diff do PR: o import do teste novo reescrito
 para `go.mau.fi/whatsmeow`; e o grupo de campos novos de `engineCall`, que
 conflitava com os campos do #26, posto depois deles.
+
+### #46 — portão por oferta (`WithOfferGate`) e `HookError`
+
+Com o #43 a mídia sobe em **toda** oferta de entrada, e quem hospeda a lib não
+tinha como recusar uma antes disso. `WithOfferGate(fn)` é consultada no
+`onOffer` antes de qualquer coisa — antes de decifrar a chave, do
+`<preaccept>` e da mídia — com `CallID`, `From`, `Creator`, `Group` e
+`Video`. Recusada, a oferta não deixa rastro: o aparelho fica tão quieto
+quanto um whatsmeow sem pilha de chamada, e o `OnIncomingCall` não dispara.
+`Client.HookError()` diz se o gancho nos handlers do whatsmeow entrou.
+
+O CRM usa o portão para não subir mídia de oferta de vídeo (a ponte é só de
+áudio), de grupo, e acima do teto de chamadas simultâneas do processo; e o
+`HookError` para recusar toda oferta da conexão quando o gancho não entrou.
+
+Port: só o import do hypermeow reescrito (`logging.go` e
+`offer_gate_test.go`). Aplicou limpo sobre o #43, que mexe no mesmo `onOffer`.
+Sem medição com chamada real — o portão é anterior a tudo que fala com o
+WhatsApp, e o teste do PR cobre a recusa.
+
+### #47 — o `<reject>` de outro aparelho da conta não encerra a chamada de entrada
+
+Numa chamada de entrada, o `<reject>` que chega a este aparelho vem de outro
+aparelho da mesma conta recusando só por si (o autor o viu com
+`reason="unavailable"`); quem liga segue chamando e encerra com
+`<terminate>`. A lib derrubava a chamada com qualquer `<reject>`. Agora o de
+entrada só é logado; a de saída não muda (ali é o contato recusando).
+
+Port: só o import do teste. **Risco:** se o `<terminate>` de uma chamada
+recusada por outro aparelho se perder, a mídia fica de pé até quem hospeda a
+lib a encerrar — no CRM, a rede de segurança (prazo da linha e varredura); e
+o CRM, enquanto a linha dele der a recusa como desfecho, encerra a mídia
+localmente junto com ela. **Não validado com chamada real**: que a recusa da
+conta inteira chega aos irmãos como `<terminate reason="rejected_elsewhere">`
+(e não como `<reject>`) é o que o CRM supõe e o que a chamada real tem de
+confirmar.
 
 ### A medição que justifica carregar os dois (12/10/2026, staging do CRM)
 
@@ -118,11 +160,16 @@ Para carregar um PR novo: aplique-o sobre a `whatsmeow-base`, commite com
 prefixo numérico define a ordem), e documente-o aqui — PR, head, o que resolve,
 a medição e os riscos.
 
-## Patch nosso (não é PR do upstream)
+## Patches nossos (não são PRs do upstream)
 
 | # | Título | Autor | Arquivo |
 | --- | --- | --- | --- |
 | 3 | Encerrar só local (`Call.EndLocal`) e o `<accept>` de outro aparelho da conta encerra a chamada de entrada | Lugwave | `0003-lugwave-encerrar-local.patch` |
+| 6 | `recover()` nas goroutines de mídia e nos ganchos do whatsmeow | Lugwave | `0006-lugwave-recover.patch` |
+| 7 | Testes do código de vários relays: fanout, filtro de replay e filtro de `relaylatency` | Lugwave | `0007-lugwave-testes-relays.patch` |
+
+As seções abaixo até "Por que não adotamos o hypermeow" são do 0003; o 0006 e o
+0007 estão nas duas seções seguintes a ele.
 
 Aplica depois dos dois PRs (mexe no `engine.onAccept` e no `livecall.go`, que
 eles não tocam nesses pontos).
@@ -183,6 +230,70 @@ upstream**: o #47 (o `<reject>` de outro aparelho da conta não encerra a
 chamada de entrada) é do mesmo assunto, e os dois juntos fecham o ciclo de vida
 da chamada de entrada num aparelho conectado.
 
+## 0006 — `recover()` nas goroutines de mídia e nos ganchos do whatsmeow
+
+Um processo que hospeda a lib costuma levar muitas sessões do whatsmeow — no
+CRM, todas as conexões de todas as empresas. Um panic numa goroutine que o Go
+não recupera derruba todas elas, não só a chamada. O whatsmeow recupera panic
+em handler de **evento**, mas não em handler de **nó** (o gancho `<ack>`/`<call>`
+da lib roda numa goroutine crua da fila de handlers dele), e nada recuperava as
+goroutines que a mídia sobe.
+
+O que muda (`panic_guard.go`, e um `defer` em cada ponto):
+
+- toda goroutine de uma chamada — `runMedia`, envio, keepalive, vigia de
+  silêncio, RTCP, mixer de grupo — recupera o panic, loga com a pilha (nível
+  erro) e **encerra a chamada** com o motivo `media_panic`
+  (`EndReasonMediaPanic`), numa goroutine nova: quem entrou em panic pode
+  estar segurando o lock do engine, e a guarda não pode travar nele;
+- o encerramento segue a regra do `EndLocal`: chamada de **entrada ainda
+  tocando aqui** (ou na sala de espera do grupo) acaba só localmente — pode
+  estar tocando nos outros aparelhos; chamada **atendida aqui** e toda chamada
+  **de saída** levam também o `<terminate>`, para o outro lado não ficar numa
+  ligação muda;
+- a ligação a um relay que entra em panic vira "relay não conectou"; o leitor
+  de um relay do fanout que entra em panic vira "aquele relay caiu" (os
+  outros seguem);
+- o gancho `<call>` que entra em panic devolve o nó ao handler do próprio
+  whatsmeow (que manda o ack e gera o evento de sempre); o `<ack>` só loga;
+- o handler de eventos da lib recupera o próprio panic: sem isso, o recover do
+  whatsmeow pularia os handlers que o hospedeiro registrou depois do dela.
+
+**Riscos conhecidos:** um panic com o lock do engine seguro deixa o lock preso
+— o processo sobrevive, mas as chamadas daquela conexão param (e, como o
+handler de eventos da lib espera o lock, o despacho de eventos daquela
+conexão também). É pior para aquela conexão e melhor para todas as outras.
+Os testes (`panic_guard_test.go`) provocam panics de verdade (escrita em mapa
+nil, ponteiro nil) nas guardas; não há como provocar um panic dentro do
+`runMedia` sem relay de verdade.
+
+**Critério de saída:** quando o upstream tiver recover equivalente.
+
+## 0007 — testes do código de vários relays
+
+O #26 trouxe três peças sem teste automatizado — a lib as marca "NOT
+VALIDATED: live-relay only". O 0007 testa as três (`relay_fanout_test.go`):
+
+- **fanout**: contra relays **locais** que falam a mesma pilha (UDP, DTLS,
+  SCTP, DataChannel pré-negociado — `relay.ConnectRelayMedia` de verdade): o
+  envio vai a todos, o allocate de cada relay vai só a ele, o envio de grupo
+  só ao primeiro, a entrada de todos é juntada, um relay que cai não derruba a
+  chamada e o último que cai fecha o fanout; e o `connectAndAllocateAll` liga
+  cada endpoint distinto da oferta (o FNA primeiro, numa chamada de entrada),
+  pula o duplicado e o que não tem token, e manda a cada relay o allocate com
+  o token dele;
+- **filtro de replay** (SSRC, seq): a segunda e a terceira cópias caem, outro
+  SSRC é outro fluxo, colisão de slot no anel de 1024 e a volta do seq;
+- **filtro de `relaylatency`**: só se responde relay que está na oferta; sem
+  oferta para comparar, responde-se tudo (o comportamento de antes); chamada de
+  saída não responde.
+
+A única linha de código fora de teste: o `onRelayLatency` passa a enviar pelo
+`transmitCallNode`/`nextCallNodeID` do engine — que, com um whatsmeow de
+verdade, são exatamente o `SendNode`/`GenerateMessageID` de antes — para o
+teste ver o que foi respondido. **O que estes testes não dizem:** que os relays
+do WhatsApp nos aceitam; isso continua sendo só chamada real.
+
 ## Por que não adotamos o hypermeow
 
 Desde 06/09/2026 o meowcaller importa o hypermeow — um fork do whatsmeow, do
@@ -217,10 +328,23 @@ O script, rodado a partir da `main`:
 A versão do whatsmeow tem de ser a mesma que `apps/api/go.mod` do CRM pina.
 
 Regenerar recria a branch, então publicá-la é um `git push -f origin
-whatsmeow-base`. **Antes disso, marque o topo antigo com uma tag**
-(`git tag base-AAAAMMDD origin/whatsmeow-base && git push origin base-AAAAMMDD`):
-a pseudo-versão que o CRM pina só resolve enquanto o commit for alcançável por
-alguma branch ou tag, e o CRM em produção pode estar pinado no topo antigo.
+whatsmeow-base`. **Antes disso, todo commit que algum `go.mod` do CRM pina tem
+de ter tag**: a pseudo-versão só resolve (fora do cache do proxy) enquanto o
+commit for alcançável por alguma branch ou tag, e o CRM em produção pode estar
+pinado num topo antigo.
+
+As tags são `lugwave-v0.0.N`, uma por topo que o CRM pinou, em ordem:
+
+| Tag | Commit | Quem pina |
+| --- | --- | --- |
+| `lugwave-v0.0.1` | `a57027d` | produção desde a 1.50.18 (#26 e #43) |
+| `lugwave-v0.0.2` | `101663a` | rascunhos #3366/#3367 do CRM (+ encerrar local) |
+| `lugwave-v0.0.3` | o topo de 16/10/2026 | #3365 (+ #46, #47, recover e testes) |
+
+O prefixo `lugwave-` é de propósito: não é uma versão semver do módulo para o
+Go, então a tag só segura o commit e não muda como o CRM o referencia (segue
+pela pseudo-versão `v0.0.0-<data>-<sha12>`). Ao pinar um topo novo no CRM,
+crie a tag seguinte nele e empurre (`git push origin lugwave-v0.0.N`).
 
 Entre uma regeneração e outra, um PR novo pode entrar como commit comum no topo
 da `whatsmeow-base` (push normal, sem `-f`) — foi assim que o #26, o #43 e o
