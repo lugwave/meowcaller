@@ -960,8 +960,11 @@ func (e *engine) onRelayLatency(ev *events.CallRelayLatency) {
 			RelayName:    p.relayName,
 			AddressBytes: p.addr,
 		})
-		resp.Attrs["id"] = e.c.wa.GenerateMessageID()
-		if err := e.c.wa.DangerousInternals().SendNode(context.Background(), resp); err != nil {
+		// The same whatsmeow calls as before (nextCallNodeID and
+		// transmitCallNode wrap GenerateMessageID and SendNode), through the
+		// engine's seam so a test can see what is answered.
+		resp.Attrs["id"] = e.nextCallNodeID()
+		if err := e.transmitCallNode(context.Background(), resp); err != nil {
 			e.c.log.Error().Err(err).Str("call_id", ev.CallID).Msg("send relaylatency failed")
 			return
 		}
