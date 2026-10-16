@@ -168,6 +168,10 @@ func (e *engine) install() {
 		e.c.log.Error().Err(err).Msg("raw call adapter is unavailable")
 	}
 	e.c.wa.AddEventHandler(func(evt any) {
+		// whatsmeow recovers handler panics too, but it does so around the
+		// whole handler list: a panic here would skip every handler the host
+		// registered after this one, for this event.
+		defer e.recoverHandler(fmt.Sprintf("event %T", evt), nil)
 		switch ev := evt.(type) {
 		case *events.CallOffer:
 			e.onOffer(ev)
@@ -1545,6 +1549,9 @@ func (e *engine) installCallAckHook() error {
 			}
 			return nil
 		}
+		// Node handlers run on a bare goroutine of whatsmeow's handler queue,
+		// with no recover: a panic here would kill the host process.
+		defer e.recoverHandler("call ack node", nil)
 		e.onCallAck(node)
 		return nil
 	})
@@ -1555,7 +1562,7 @@ func (e *engine) installCallAckHook() error {
 		// onCallRaw returns true when it fully handled the node (incl. its own ack), so
 		// whatsmeow's generic typeless ack is skipped — the <video> upgrade needs a typed
 		// type="video" ack, which a bare ack does not satisfy (the peer reverts otherwise).
-		if e.onCallRaw(node) {
+		if e.onCallRawGuarded(node) {
 			return nil
 		}
 		if origCall.IsValid() && !origCall.IsNil() {

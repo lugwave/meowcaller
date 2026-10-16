@@ -9,6 +9,7 @@ import (
 	"io"
 	"math"
 	"net"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -100,6 +101,7 @@ func (e *engine) maybeStartMedia(callID string) {
 	}
 	e.c.log.Info().Str("call_id", callID).Msg("starting media")
 	go func() {
+		defer e.recoverMedia("media", callID)
 		defer clear(callKey)
 		if err := e.runMedia(mctx, callID, call, callKey, selfLID, peerLID, rd, inbound); err != nil {
 			e.c.log.Warn().Err(err).Str("call_id", callID).Msg("media ended")
@@ -158,7 +160,7 @@ func (e *engine) connectAndAllocateAll(ctx context.Context, rd *relayData, strea
 		return nil, fmt.Errorf("no relay reachable (%d offered)", len(targets))
 	}
 	e.c.log.Info().Int("connected", len(chans)).Int("offered", len(targets)).Strs("relays", names).Msg("relay fanout established")
-	return newRelayFanout(chans, allocs, names), nil
+	return newRelayFanout(chans, allocs, names, e.c.log), nil
 }
 
 // connectOneRelay opens the relay DataChannel and sends the STUN allocate for a
@@ -184,6 +186,16 @@ func (e *engine) connectOneRelay(ctx context.Context, rd *relayData, ep *relayEn
 	}
 	done := make(chan result, 1)
 	go func() {
+		// A panic in the transport stack is a failed connect, not a crashed
+		// process. done is buffered: the send never blocks, even after the
+		// timeout below gave up on it.
+		defer func() {
+			if r := recover(); r != nil {
+				log.Error().Str("panic", fmt.Sprint(r)).Str("stack", string(debug.Stack())).
+					Msg("panic while connecting to relay recovered")
+				done <- result{nil, fmt.Errorf("relay connect panicked: %v", r)}
+			}
+		}()
 		ch, err := relay.ConnectRelayMedia(addr, relay.WithLogger(log))
 		done <- result{ch, err}
 	}()
@@ -446,6 +458,7 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 	audioMixer := newParticipantAudioMixer()
 	var audioSinkFramer participantAudioSinkFramer
 	go func() {
+		defer e.recoverMedia("group audio mixer", callID)
 		ticker := time.NewTicker(time.Duration(participantAudioMixChunkSamples) * time.Second / SampleRate)
 		defer ticker.Stop()
 		playoutStarted := false
@@ -520,6 +533,7 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 	// Inbound calls are torn down by the caller within ~400ms if the relay bind never
 	// comes alive; check at 400ms and 900ms and say so explicitly.
 	go func() {
+		defer e.recoverMedia("relay silence watchdog", callID)
 		for _, d := range []time.Duration{400 * time.Millisecond, 900 * time.Millisecond} {
 			select {
 			case <-ctx.Done():
@@ -538,6 +552,7 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 	// Binding-requests instead flip the relay into ICE-consent mode and the bridge never
 	// forms.
 	go func() {
+		defer e.recoverMedia("relay keepalive", callID)
 		t := time.NewTicker(time.Second)
 		defer t.Stop()
 		var tickCount uint64
@@ -630,6 +645,7 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 	// Player has real audio (nextFrame() == nil means send silence).
 	frameInterval := time.Duration(FrameSamples) * time.Second / SampleRate
 	go func() {
+		defer e.recoverMedia("send loop", callID)
 		silence := make([]float32, FrameSamples)
 		ticker := time.NewTicker(frameInterval)
 		defer ticker.Stop()
@@ -807,6 +823,7 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 	// SR+SDES packets are required for the caller's video to start flowing to the
 	// answerer, and give the peer a target for PLI/FIR recovery feedback.
 	go func() {
+		defer e.recoverMedia("rtcp sender", callID)
 		ticker := time.NewTicker(1500 * time.Millisecond)
 		defer ticker.Stop()
 		var sent uint64

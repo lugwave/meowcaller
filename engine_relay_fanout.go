@@ -2,9 +2,12 @@ package meowcaller
 
 import (
 	"errors"
+	"fmt"
+	"runtime/debug"
 	"sync"
 
 	"github.com/purpshell/meowcaller/relay"
+	"github.com/rs/zerolog"
 )
 
 // relayFanout runs one logical media channel across every usable relay in the
@@ -30,6 +33,8 @@ type relayFanout struct {
 	mu     sync.Mutex
 	closed bool
 	live   int
+
+	log zerolog.Logger
 }
 
 // fanoutBacklog bounds merged inbound packets awaiting Recv. At 60ms audio
@@ -40,8 +45,9 @@ const fanoutBacklog = 256
 var errFanoutClosed = errors.New("meowcaller: relay fanout closed")
 
 // newRelayFanout takes ownership of the channels and their matching per-relay
-// allocate payloads, and starts one reader per channel.
-func newRelayFanout(chans []*relay.RelayMediaChannel, allocs [][]byte, names []string) *relayFanout {
+// allocate payloads, and starts one reader per channel. The optional logger
+// reports a reader that panicked (see guardedReadLoop).
+func newRelayFanout(chans []*relay.RelayMediaChannel, allocs [][]byte, names []string, log ...zerolog.Logger) *relayFanout {
 	// Source of truth: https://github.com/JotaDev66/WaCalls/blob/edeb31f0427aba896639db503153b777a405eccf/internal/voip/transport/sctprelay.go#L105-L127
 	f := &relayFanout{
 		chans:   chans,
@@ -50,11 +56,29 @@ func newRelayFanout(chans []*relay.RelayMediaChannel, allocs [][]byte, names []s
 		packets: make(chan []byte, fanoutBacklog),
 		done:    make(chan struct{}),
 		live:    len(chans),
+		log:     zerolog.Nop(),
+	}
+	if len(log) > 0 {
+		f.log = log[0]
 	}
 	for _, ch := range chans {
-		go f.readLoop(ch)
+		go f.guardedReadLoop(ch)
 	}
 	return f
+}
+
+// guardedReadLoop is readLoop behind a recover: a panic in one relay's
+// transport stack counts as that relay's reader dying (the others keep the
+// call's media going), never as a crashed process.
+func (f *relayFanout) guardedReadLoop(ch *relay.RelayMediaChannel) {
+	defer func() {
+		if r := recover(); r != nil {
+			f.log.Error().Str("panic", fmt.Sprint(r)).Str("stack", string(debug.Stack())).
+				Msg("panic in relay reader recovered; dropping that relay")
+			f.readerExited()
+		}
+	}()
+	f.readLoop(ch)
 }
 
 func (f *relayFanout) readLoop(ch *relay.RelayMediaChannel) {

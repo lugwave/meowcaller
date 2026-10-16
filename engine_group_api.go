@@ -606,6 +606,7 @@ func (e *engine) startWaitingRoomHeartbeat(callID string) {
 	creator := m.creator
 	e.mu.Unlock()
 	go func() {
+		defer e.recoverHandler("waiting room heartbeat", nil)
 		ticker := time.NewTicker(15 * time.Second)
 		defer ticker.Stop()
 		for {
