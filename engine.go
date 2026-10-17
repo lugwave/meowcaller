@@ -92,6 +92,16 @@ type engineCall struct {
 	earlyMuteCreator types.JID
 	inboundSeen      bool
 	answered         bool
+
+	// lugwave (experimental): what an inbound 1:1 call sends before Answer
+	// (WithInboundEarlyMedia). txRelease is non-nil while audio RTP (and, in
+	// EarlyMediaHoldRTPAndRTCP, SRTCP) is held; Answer closes it once
+	// (txReleased). offerAt/answeredAt time the logs.
+	earlyMode  EarlyMediaMode
+	txRelease  chan struct{}
+	txReleased bool
+	offerAt    time.Time
+	answeredAt time.Time
 }
 
 // newEngine creates the engine for a Client.
@@ -563,13 +573,13 @@ func (e *engine) onOffer(ev *events.CallOffer) {
 		e.c.log.Warn().Err(groupErr).Str("call_id", ev.CallID).Msg("parse inbound group offer failed")
 		return
 	}
+	offer := Offer{
+		CallID: ev.CallID, From: ev.From, Creator: ev.CallCreator,
+		Group: isGroup, Video: signaling.OfferHasVideo(ev.Data),
+	}
 	// The gate runs before anything is decrypted or sent: a refused offer leaves this
 	// device exactly as silent as a whatsmeow client without a call stack.
 	if gate := e.c.offerGate; gate != nil {
-		offer := Offer{
-			CallID: ev.CallID, From: ev.From, Creator: ev.CallCreator,
-			Group: isGroup, Video: signaling.OfferHasVideo(ev.Data),
-		}
 		if !gate(offer) {
 			e.c.log.Debug().Str("call_id", ev.CallID).Msg("offer refused by the offer gate; not engaging")
 			return
@@ -634,10 +644,19 @@ func (e *engine) onOffer(ev *events.CallOffer) {
 		relay = parseRelayData(r)
 	}
 	codec, hasCodec := e.voipSettingsCodec(ev.Data, ev.CallID)
+	earlyMode := EarlyMediaFull
+	if fn := e.c.earlyMedia; fn != nil {
+		earlyMode = fn(offer)
+	}
 
 	e.mu.Lock()
 	m := e.entry(ev.CallID)
 	m.call = call
+	m.earlyMode = earlyMode
+	m.offerAt = time.Now()
+	if earlyMode.holdsOutbound() {
+		m.txRelease = make(chan struct{})
+	}
 	m.callKey = callKey
 	m.selfLID = selfLID.String()
 	m.peerLID = peer.String()
@@ -675,6 +694,11 @@ func (e *engine) onOffer(ev *events.CallOffer) {
 		e.c.log.Warn().Err(err).Str("call_id", ev.CallID).Msg("preaccept failed")
 	}
 
+	if earlyMode != EarlyMediaFull {
+		e.c.log.Warn().Str("call_id", ev.CallID).Str("early_media", earlyMode.String()).
+			Msg("EXPERIMENT inbound early media mode is not the default")
+	}
+	// EarlyMediaOff: maybeStartMedia itself refuses a ringing inbound call.
 	e.maybeStartMedia(ev.CallID)
 
 	if fn := e.c.incomingCallHandler(); fn != nil {
@@ -773,13 +797,34 @@ func (e *engine) answer(c *Call) error {
 	e.mu.Lock()
 	m.acceptPending = true
 	m.answered = true
+	m.answeredAt = time.Now()
 	muteSeen, from, creator, inbound := m.earlyMuteSeen, m.earlyMuteFrom, m.earlyMuteCreator, m.inboundSeen
+	earlyMode, offerAt := m.earlyMode, m.offerAt
+	released := false
+	if m.txRelease != nil && !m.txReleased {
+		close(m.txRelease)
+		m.txReleased = true
+		released = true
+	}
+	offerFrom, offerCreator := m.from, m.creator
 	e.mu.Unlock()
+	if released {
+		e.c.log.Warn().Str("call_id", c.id).Str("early_media", earlyMode.String()).
+			Int64("since_offer_ms", time.Since(offerAt).Milliseconds()).
+			Bool("mute_v2_seen", muteSeen).
+			Msg("EXPERIMENT outbound audio released on Answer")
+	}
 
 	e.maybeStartMedia(c.id)
 	if muteSeen {
 		e.c.log.Info().Str("call_id", c.id).Msg("mute_v2 arrived while ringing; sending accept")
 		e.sendAccept(c.id, from, creator)
+	} else if earlyMode != EarlyMediaFull {
+		// With the early media held (or off), the caller's <mute_v2> is expected right
+		// after our audio reaches it, and the deferred <accept> goes out from there
+		// (onCallRaw) — the pre-#43 order. If it never comes, do not leave the call
+		// unaccepted: send the <accept> anyway, and say so.
+		e.armAcceptFallback(c.id, offerFrom, offerCreator, earlyMode)
 	}
 	if inbound {
 		c.setPhase(CallPhaseActive)
@@ -788,6 +833,40 @@ func (e *engine) answer(c *Call) error {
 		}
 	}
 	return nil
+}
+
+// acceptFallbackDelay is how long Answer waits for the caller's <mute_v2> before
+// sending the deferred <accept> on its own, in the experimental early media modes.
+// A variable so the tests can shorten it.
+var acceptFallbackDelay = 3 * time.Second
+
+// armAcceptFallback sends the deferred <accept> if it is still pending
+// acceptFallbackDelay after Answer (no <mute_v2> came). sendAccept is idempotent: the
+// mute_v2 path and this one cannot both send it.
+func (e *engine) armAcceptFallback(callID string, to, creator types.JID, mode EarlyMediaMode) {
+	time.AfterFunc(acceptFallbackDelay, func() {
+		defer e.recoverMedia("accept fallback", callID)
+		e.mu.Lock()
+		m := e.calls[callID]
+		pending := m != nil && m.acceptPending
+		e.mu.Unlock()
+		if !pending {
+			return
+		}
+		e.c.log.Warn().Str("call_id", callID).Str("early_media", mode.String()).
+			Dur("after", acceptFallbackDelay).
+			Msg("EXPERIMENT no mute_v2 after Answer; sending the deferred accept anyway")
+		e.sendAccept(callID, to, creator)
+	})
+}
+
+// acceptRequestID is the id of a callee <accept>: whatsmeow's request id, as before;
+// a random one when there is no whatsmeow client (tests).
+func (e *engine) acceptRequestID() string {
+	if e.c != nil && e.c.wa != nil {
+		return e.c.wa.DangerousInternals().GenerateRequestID()
+	}
+	return e.nextCallNodeID()
 }
 
 // sendAccept sends the deferred callee <accept> (once), in the WA-Web format (metadata +
@@ -809,8 +888,10 @@ func (e *engine) sendAccept(callID string, to, creator types.JID) {
 		Metadata:   waBinary.Attrs{"peer_abtest_bucket_id_list": "125208,94276"},
 		Video:      isVideo,
 	})
-	accept.Attrs["id"] = e.c.wa.DangerousInternals().GenerateRequestID()
-	if err := e.c.wa.DangerousInternals().SendNode(context.Background(), accept); err != nil {
+	accept.Attrs["id"] = e.acceptRequestID()
+	// transmitCallNode is whatsmeow's SendNode (newEngine), the same call as before,
+	// through the engine's seam so a test can see the accept.
+	if err := e.transmitCallNode(context.Background(), accept); err != nil {
 		e.c.log.Error().Err(err).Str("call_id", callID).Msg("send accept failed")
 		return
 	}

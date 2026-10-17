@@ -16,6 +16,8 @@ type config struct {
 	diag *diag.Recorder
 
 	offerGate func(Offer) bool
+
+	earlyMedia func(Offer) EarlyMediaMode
 }
 
 func resolveConfig(opts []Option) config {
@@ -63,4 +65,56 @@ type Offer struct {
 // dispatch: keep it short.
 func WithOfferGate(fn func(Offer) bool) Option {
 	return func(c *config) { c.offerGate = fn }
+}
+
+// EarlyMediaMode says what an inbound 1:1 call sends to the relay while it is still
+// ringing here, before Answer. EXPERIMENTAL (lugwave): the default is the upstream
+// PR #43 behavior; the other modes exist to measure, with real calls, which of the
+// early packets makes the caller's phone count the call as connected.
+type EarlyMediaMode int
+
+const (
+	// EarlyMediaFull is the default (PR #43): from the offer the library connects
+	// the relays, allocates, pings and sends audio RTP (silence) and SRTCP sender
+	// reports. The caller's phone starts its call clock (audio_duration) on that
+	// media, before Answer.
+	EarlyMediaFull EarlyMediaMode = iota
+	// EarlyMediaHoldRTP connects, allocates, pings and sends SRTCP sender reports
+	// from the offer, but no audio RTP until Answer.
+	EarlyMediaHoldRTP
+	// EarlyMediaHoldRTPAndRTCP connects, allocates and pings from the offer (the
+	// relay transport and the 1 Hz allocate+ping keepalive), but sends neither
+	// audio RTP nor SRTCP until Answer. Inbound packets are still read and decoded.
+	EarlyMediaHoldRTPAndRTCP
+	// EarlyMediaOff starts no media before Answer: the behavior before PR #43
+	// (expected: the call clock is right, but a late Answer gets no inbound audio).
+	EarlyMediaOff
+)
+
+// String returns the mode's stable name, as logged.
+func (m EarlyMediaMode) String() string {
+	switch m {
+	case EarlyMediaFull:
+		return "full"
+	case EarlyMediaHoldRTP:
+		return "hold_rtp"
+	case EarlyMediaHoldRTPAndRTCP:
+		return "hold_rtp_rtcp"
+	case EarlyMediaOff:
+		return "off"
+	}
+	return "unknown"
+}
+
+// holdsOutbound reports whether audio RTP waits for Answer in this mode.
+func (m EarlyMediaMode) holdsOutbound() bool {
+	return m == EarlyMediaHoldRTP || m == EarlyMediaHoldRTPAndRTCP
+}
+
+// WithInboundEarlyMedia chooses, per inbound 1:1 offer, what is sent before Answer
+// (see EarlyMediaMode). fn runs on whatsmeow's event dispatch, after the offer gate:
+// keep it short. Without it every call uses EarlyMediaFull. Group calls and outbound
+// calls are not affected.
+func WithInboundEarlyMedia(fn func(Offer) EarlyMediaMode) Option {
+	return func(c *config) { c.earlyMedia = fn }
 }
