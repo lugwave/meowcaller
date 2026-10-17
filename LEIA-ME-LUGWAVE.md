@@ -19,7 +19,8 @@ o `main` do upstream com **três camadas** por cima, cada uma em commits própri
 3. **Patches nossos** (um commit cada): o encerrar só local (desde
    12/10/2026), o `recover()` nas goroutines e nos ganchos da lib, os testes
    do código de vários relays e o lock que não fica preso depois de um panic
-   (desde 16/10/2026). Não são PRs do upstream — é
+   (desde 16/10/2026), e o áudio de saída da chamada recebida esperar o
+   `Answer()` (desde 17/10/2026). Não são PRs do upstream — é
    lógica escrita por nós, pequena, e a intenção é propô-la lá. **Aqui a
    lógica também muda.**
 
@@ -79,6 +80,12 @@ O que o port tem de diferente do diff do PR: o import do teste novo reescrito
 para `go.mau.fi/whatsmeow`; e o grupo de campos novos de `engineCall`, que
 conflitava com os campos do #26, posto depois deles.
 
+**Efeito colateral corrigido pelo patch nosso 0009:** o PR sobe também o
+**áudio** (RTP de silêncio e SRTCP) na oferta, e o celular de quem liga conta a
+chamada como conectada a partir do áudio que recebe — a recusada aparecia lá como
+"ligação efetuada". O 0009 mantém da oferta só o transporte, o allocate e o
+keepalive, e segura o áudio até o `Answer()`.
+
 ### #46 — portão por oferta (`WithOfferGate`) e `HookError`
 
 Com o #43 a mídia sobe em **toda** oferta de entrada, e quem hospeda a lib não
@@ -131,13 +138,15 @@ dos 5 pacotes. Um sem o outro não resolve.
 
 ### Riscos conhecidos
 
-- **A mídia sobe em TODA oferta, atendida ou não** (#43). Cada chamada que toca
-  abre sockets, aloca nos relays da oferta — em todos, por causa do #26 — e
+- **O transporte sobe em TODA oferta, atendida ou não** (#43). Cada chamada que
+  toca abre sockets, aloca nos relays da oferta — em todos, por causa do #26 — e
   mantém keepalive até a chamada terminar, mesmo que ninguém atenda. É custo de
-  rede e de CPU por chamada tocando, não só por chamada atendida.
-- **O `audio_duration` do interlocutor passa a contar antes do accept** (#43):
-  como a mídia já está de pé enquanto toca, a duração de áudio que o outro lado
-  apura inclui o tempo de toque. Não use esse número como duração de conversa.
+  rede por chamada tocando, não só por chamada atendida. Desde o 0009 o
+  codificador não roda enquanto toca (o áudio espera o `Answer()`).
+- ~~**O `audio_duration` do interlocutor passa a contar antes do accept**~~
+  (#43) — **resolvido pelo 0009** (17/10/2026, medido com chamada real): com o
+  áudio segurado até o `Answer()`, a recusada e a não atendida chegam sem
+  `audio_duration`, e a atendida bate com o aceite.
 - **O #43 valida o caminho novo só por teste unitário** na parte da passagem
   ordenada pelo lock (palavras do próprio PR); a nossa validação com chamada
   real são as 3 chamadas acima — pouco para chamar de soak.
@@ -169,9 +178,10 @@ a medição e os riscos.
 | 6 | `recover()` nas goroutines de mídia e nos ganchos do whatsmeow | Lugwave | `0006-lugwave-recover.patch` |
 | 7 | Testes do código de vários relays: fanout, filtro de replay e filtro de `relaylatency` | Lugwave | `0007-lugwave-testes-relays.patch` |
 | 8 | O lock do engine não fica preso depois de um panic de parse; a guarda não espera por ele para sempre; avisos sem o número | Lugwave | `0008-lugwave-lock-apos-panic.patch` |
+| 9 | O áudio de saída da chamada recebida espera o `Answer()` (`WithInboundEarlyMedia`) | Lugwave | `0009-lugwave-audio-ate-atender.patch` |
 
 As seções abaixo até "Por que não adotamos o hypermeow" são do 0003; o 0006, o
-0007 e o 0008 estão nas seções seguintes a ele.
+0007, o 0008 e o 0009 estão nas seções seguintes a ele.
 
 Aplica depois dos dois PRs (mexe no `engine.onAccept` e no `livecall.go`, que
 eles não tocam nesses pontos).
@@ -325,6 +335,74 @@ Por cima do 0006, da revisão independente do CRM:
 
 Testes em `panic_lock_test.go`.
 
+## 0009 — o áudio de saída da chamada recebida espera o `Answer()`
+
+Por cima do #43 (e de todos os anteriores).
+
+### O que faz
+
+Na chamada **recebida 1:1**, o padrão passa a ser `EarlyMediaHoldAudio`: da
+oferta, a lib mantém o que o relay precisa para fazer a ponte do áudio de quem
+liga num atender tardio — transporte (DTLS/SCTP/DataChannel), allocate em todos
+os relays e o keepalive allocate+ping de 1 Hz — e **segura o RTP de áudio e o
+SRTCP até o `Answer()`**; a entrada segue sendo lida. No `Answer()` o envio
+começa do zero (primeiro número de sequência, primeiro timestamp). O `<accept>`
+adiado volta a sair do `mute_v2` de quem liga, que agora chega **depois** do
+`Answer()` (a ordem de antes do #43); se ele não vier em 3 s, o `<accept>` sai
+mesmo assim, com aviso no log.
+
+`WithInboundEarlyMedia(fn)` escolhe por oferta; `EarlyMediaFull` é o #43 como
+proposto (áudio desde a oferta) e fica **só como rollback**. Saída e grupo não
+mudam. Logs: a liberação no `Answer()` e o primeiro RTP/SR enviado e recebido
+levam `since_offer_ms`/`since_answer_ms` (Info). Única mudança fora disso: o
+`sendAccept` passa pelo `transmitCallNode` do engine — com um whatsmeow de
+verdade, o mesmo `SendNode` de antes — e pelo `GenerateRequestID` de sempre.
+
+### Por quê
+
+O celular de quem liga começa o relógio da chamada quando o nosso áudio chega:
+nas chamadas reais de 17/10/2026 (Android 2.26.40.76) o `audio_duration` do
+`<terminate>` bateu, ao milissegundo, com o tempo desde o `mute_v2` dele, que
+saía ~0,7 s depois da oferta — o `<preaccept>` (em +3 ms) não era o gatilho, e
+o primeiro sender report nosso só sai em +1,5 s. Com o #43, a recusada vinha com
+`audio_duration="13328"` e aparecia como "ligação de voz efetuada"; a não
+atendida com `44745`; a atendida com ~15 s a mais que o CRM; e o aparelho
+pareado dizia "atendida em outro dispositivo".
+
+### A medição (17/10/2026, staging do CRM, quem liga com WhatsApp Web conectado)
+
+| Chamada | Resultado com o 0009 |
+| --- | --- |
+| atendida pelo CRM | `mute_v2` de quem liga 0,48 s **depois** do `Answer()`; `<accept>` adiado saiu dele; primeiro RTP de entrada 311 ms depois do `Answer()`; áudio dos dois lados (entrada 9,54 s em 18 s); duração no celular igual à do CRM |
+| recusada pelo CRM | `<terminate>` **sem** `audio_duration` (antes: 13328); "não atendida" em quem ligou, "chamada de voz perdida" no pareado (antes: "atendida em outro dispositivo") |
+| quem ligou desistiu aos 13 s | `<terminate>` sem `audio_duration` (antes: 44745); a mídia parou na hora |
+| atendida no celular pareado | `terminate accepted_elsewhere`, a mídia parou na hora |
+
+O A/B foi feito com uma branch experimental (tag
+`lugwave-exp-audio-ate-atender-1`) que também tinha "segurar só o RTP" e "nada
+antes do atender" — removidas por não servirem para nada depois da medição.
+
+### Riscos conhecidos
+
+- **O fallback de 3 s não foi exercitado** com chamada real: o `mute_v2` veio
+  sempre em ~0,5 s. Se um aparelho não mandar `mute_v2`, o `<accept>` sem ele é
+  território não medido.
+- Uma amostra: um aparelho de quem liga (Android 2.26.40.76), uma rede. iPhone e
+  WhatsApp Desktop como quem liga não foram medidos.
+
+### Testes
+
+`early_media_hold_test.go`: a mídia de verdade contra um relay local (o
+`fakeRelay` do 0007) conta STUN, RTP e RTCP antes e depois do `Answer()` nos dois
+modos; o padrão sem a opção; o `<accept>` no `mute_v2` depois do `Answer()`, o
+fallback sem `mute_v2` e nenhum fallback no rollback.
+
+### Critério de saída
+
+Sai quando o upstream tiver o equivalente — o #43 com o áudio segurado até o
+`Answer()`, ou uma opção para isso. **Vale propor no próprio #43**: é a resposta
+à pergunta que deixamos lá ("o que quem liga vê durante o toque").
+
 ## Por que não adotamos o hypermeow
 
 Desde 06/09/2026 o meowcaller importa o hypermeow — um fork do whatsmeow, do
@@ -372,6 +450,11 @@ As tags são `lugwave-v0.0.N`, uma por topo que o CRM pinou, em ordem:
 | `lugwave-v0.0.2` | `101663a` | rascunhos #3366/#3367 do CRM (+ encerrar local) |
 | `lugwave-v0.0.3` | `26f53bf` | primeira versão do #3459 do CRM (+ #46, #47, recover e testes) |
 | `lugwave-v0.0.4` | o topo seguinte de 16/10/2026 | #3459 do CRM depois da revisão (+ 0008) |
+| `lugwave-v0.0.5` | o topo de 17/10/2026 | release 1.50.20 do CRM (+ 0009, o áudio espera o `Answer()`) |
+
+Fora da sequência, `lugwave-exp-audio-ate-atender-1` segura o topo da branch
+experimental `exp/segurar-audio-ate-atender`, que só a branch homônima do CRM
+pinou para o A/B de 17/10/2026; nenhuma branch de release a usa.
 
 O prefixo `lugwave-` é de propósito: não é uma versão semver do módulo para o
 Go, então a tag só segura o commit e não muda como o CRM o referencia (segue
