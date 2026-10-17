@@ -26,6 +26,8 @@ type Client struct {
 
 	offerGate func(Offer) bool
 
+	earlyMedia func(Offer) EarlyMediaMode
+
 	getGroupInfo func(context.Context, types.JID) (*types.GroupInfo, error)
 	ownGroupJIDs func() []types.JID
 
@@ -56,6 +58,7 @@ func NewClient(wa *whatsmeow.Client, opts ...Option) *Client {
 	c := &Client{
 		wa: wa, log: cfg.log, diag: cfg.diag,
 		offerGate:    cfg.offerGate,
+		earlyMedia:   cfg.earlyMedia,
 		getGroupInfo: wa.GetGroupInfo,
 		ownGroupJIDs: func() []types.JID {
 			return []types.JID{wa.Store.GetJID(), wa.Store.GetLID()}

@@ -16,6 +16,8 @@ type config struct {
 	diag *diag.Recorder
 
 	offerGate func(Offer) bool
+
+	earlyMedia func(Offer) EarlyMediaMode
 }
 
 func resolveConfig(opts []Option) config {
@@ -63,4 +65,48 @@ type Offer struct {
 // dispatch: keep it short.
 func WithOfferGate(fn func(Offer) bool) Option {
 	return func(c *config) { c.offerGate = fn }
+}
+
+// EarlyMediaMode says what an inbound 1:1 call sends to the relay while it is still
+// ringing here, before Answer.
+type EarlyMediaMode int
+
+const (
+	// EarlyMediaHoldAudio is the default: from the offer the library connects the
+	// relays, allocates and runs the 1 Hz allocate+ping keepalive — what the relay
+	// needs to bridge the caller's media to a late Answer (upstream PR #43) — but
+	// sends neither audio RTP nor SRTCP until Answer. The caller's phone starts its
+	// call clock (audio_duration) when our audio reaches it, so holding the audio
+	// keeps a declined or unanswered call from showing as answered there. Inbound
+	// packets are read and decoded meanwhile.
+	EarlyMediaHoldAudio EarlyMediaMode = iota
+	// EarlyMediaFull is upstream PR #43 as proposed: audio RTP (silence) and SRTCP
+	// also go out from the offer, and the caller's phone counts the call as
+	// connected from there. Kept only as a rollback.
+	EarlyMediaFull
+)
+
+// String returns the mode's stable name, as logged.
+func (m EarlyMediaMode) String() string {
+	switch m {
+	case EarlyMediaHoldAudio:
+		return "hold_audio"
+	case EarlyMediaFull:
+		return "full"
+	}
+	return "unknown"
+}
+
+// holdsOutbound reports whether audio RTP and SRTCP wait for Answer in this mode.
+// An unknown mode holds: it is the default.
+func (m EarlyMediaMode) holdsOutbound() bool {
+	return m != EarlyMediaFull
+}
+
+// WithInboundEarlyMedia chooses, per inbound 1:1 offer, what is sent before Answer
+// (see EarlyMediaMode). fn runs on whatsmeow's event dispatch, after the offer gate:
+// keep it short. Without it every call uses EarlyMediaHoldAudio. Group calls and
+// outbound calls are not affected.
+func WithInboundEarlyMedia(fn func(Offer) EarlyMediaMode) Option {
+	return func(c *config) { c.earlyMedia = fn }
 }

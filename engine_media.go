@@ -288,10 +288,23 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 	}
 	e.mu.Lock()
 	isGroup := false
+	// lugwave: txHold is closed by Answer; nil = nothing held (EarlyMediaFull, an
+	// outbound or group call, or a media start after Answer).
+	var txHold <-chan struct{}
+	earlyMode := EarlyMediaHoldAudio
+	var offerAt time.Time
 	if mm := e.calls[callID]; mm != nil {
 		isGroup = mm.group
+		earlyMode, offerAt = mm.earlyMode, mm.offerAt
+		if mm.txRelease != nil && !mm.txReleased {
+			txHold = mm.txRelease
+		}
 	}
 	e.mu.Unlock()
+	if txHold != nil {
+		log.Info().Str("call_id", callID).Str("early_media", earlyMode.String()).
+			Msg("relay transport, allocate and keepalive start now; outbound audio RTP and SRTCP wait for Answer")
+	}
 
 	ch, err := e.connectAndAllocateAll(ctx, rd, streamSsrcs, inbound, !isGroup)
 	if err != nil {
@@ -643,6 +656,13 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 	// on relay connection and the relay learns our SSRC from our FIRST RTP — it won't
 	// bridge the peer's media until it sees our stream. So we send silence frames until the
 	// Player has real audio (nextFrame() == nil means send silence).
+	//
+	// lugwave: an inbound 1:1 call that still rings here sends nothing yet
+	// (EarlyMediaHoldAudio): the caller's phone counts the call as connected from the
+	// first audio it gets. Measured with real calls (17/10/2026): with only the
+	// transport, the allocate and the keepalive up from the offer, the relay still
+	// bridged the caller's media after a late Answer (first inbound RTP 311 ms after
+	// Answer), and the caller's clock started at Answer.
 	frameInterval := time.Duration(FrameSamples) * time.Second / SampleRate
 	go func() {
 		defer e.recoverMedia("send loop", callID)
@@ -650,11 +670,23 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 		ticker := time.NewTicker(frameInterval)
 		defer ticker.Stop()
 		var txCount uint64
+		hold := txHold
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
+			}
+			// lugwave: while the call rings here, nothing is encoded
+			// or sent; the stream starts fresh (first sequence number, first
+			// timestamp) on the first tick after Answer.
+			if hold != nil {
+				select {
+				case <-hold:
+					hold = nil
+				default:
+					continue
+				}
 			}
 			frame := silence
 			if player, _ := callPlayerSink(call); player != nil {
@@ -678,7 +710,19 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 				return
 			}
 			if txCount++; txCount == 1 {
-				log.Info().Int("bytes", len(packet)).Msg("first RTP sent to relay, outbound media flowing")
+				ev := log.Info().Str("call_id", callID).Int("bytes", len(packet))
+				if inbound {
+					ev = ev.Str("early_media", earlyMode.String())
+				}
+				if !offerAt.IsZero() {
+					ev = ev.Int64("since_offer_ms", time.Since(offerAt).Milliseconds())
+				}
+				if answeredAt := e.callAnsweredAt(callID); !answeredAt.IsZero() {
+					ev = ev.Int64("since_answer_ms", time.Since(answeredAt).Milliseconds())
+				} else if inbound {
+					ev = ev.Bool("before_answer", true)
+				}
+				ev.Msg("first RTP sent to relay, outbound media flowing")
 				e.c.diag.Emit("meta", map[string]any{"event": "first_rtp_sent", "call_id": callID, "bytes": len(packet)})
 			}
 		}
@@ -827,11 +871,22 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 		ticker := time.NewTicker(1500 * time.Millisecond)
 		defer ticker.Stop()
 		var sent uint64
+		hold := txHold
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case now := <-ticker.C:
+				// lugwave: no sender report while the call rings here
+				// (EarlyMediaHoldAudio).
+				if hold != nil {
+					select {
+					case <-hold:
+						hold = nil
+					default:
+						continue
+					}
+				}
 				nowMs := uint64(now.UnixMilli())
 				e.mu.Lock()
 				current := e.calls[callID]
@@ -878,7 +933,17 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 				}
 				sent++
 				if sent == 1 {
-					log.Info().Msg("started periodic SRTCP sender reports")
+					ev := log.Info().Str("call_id", callID)
+					if inbound {
+						ev = ev.Str("early_media", earlyMode.String())
+					}
+					if !offerAt.IsZero() {
+						ev = ev.Int64("since_offer_ms", time.Since(offerAt).Milliseconds())
+					}
+					if e.callAnsweredAt(callID).IsZero() && inbound {
+						ev = ev.Bool("before_answer", true)
+					}
+					ev.Msg("started periodic SRTCP sender reports")
 				}
 				e.c.diag.Emit("rtcp", map[string]any{
 					"event": "sender_reports", "tick": sent,
@@ -1216,7 +1281,19 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 			audioPlayoutMu.Unlock()
 		}
 		if rtpIn++; rtpIn == 1 {
-			log.Info().Msg("first RTP decoded from relay, inbound audio flowing")
+			ev := log.Info().Str("call_id", callID)
+			if inbound {
+				ev = ev.Str("early_media", earlyMode.String())
+			}
+			if !offerAt.IsZero() {
+				ev = ev.Int64("since_offer_ms", time.Since(offerAt).Milliseconds())
+			}
+			if answeredAt := e.callAnsweredAt(callID); !answeredAt.IsZero() {
+				ev = ev.Int64("since_answer_ms", time.Since(answeredAt).Milliseconds())
+			} else if inbound {
+				ev = ev.Bool("before_answer", true)
+			}
+			ev.Msg("first RTP decoded from relay, inbound audio flowing")
 			e.c.diag.Emit("meta", map[string]any{"event": "first_rtp_in", "call_id": callID})
 			e.onFirstInboundRTP(callID, call)
 		}
@@ -1679,4 +1756,15 @@ func (e *engine) onFirstInboundRTP(callID string, call *Call) {
 			fn()
 		}
 	}
+}
+
+// callAnsweredAt is when Answer ran for callID (zero if it did not, or the call is
+// gone). lugwave, for the early media logs.
+func (e *engine) callAnsweredAt(callID string) time.Time {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if m := e.calls[callID]; m != nil {
+		return m.answeredAt
+	}
+	return time.Time{}
 }
