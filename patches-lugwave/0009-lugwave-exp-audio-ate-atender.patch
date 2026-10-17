@@ -1,0 +1,864 @@
+From bbca988d5914c2eea15e03c55c3dbf37cfeb98e1 Mon Sep 17 00:00:00 2001
+From: Luan Luciano <luanluciano93@gmail.com>
+Date: Sat, 17 Oct 2026 22:15:51 +0000
+Subject: [PATCH] =?UTF-8?q?lugwave=20(EXPERIMENTO):=20WithInboundEarlyMedi?=
+ =?UTF-8?q?a=20=E2=80=94=20segurar=20o=20=C3=A1udio=20de=20sa=C3=ADda=20da?=
+ =?UTF-8?q?=20chamada=20recebida=20at=C3=A9=20o=20Answer?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Com o PR upstream #43 a mídia inteira sobe na oferta: transporte do relay,
+allocate, ping, RTP de silêncio e SRTCP. Medido com chamada real
+(17/10/2026, staging, Android 2.26.40.76 ligando): o celular de quem liga
+passa a contar a chamada como conectada desde ~0,7 s depois da oferta — o
+audio_duration do <terminate> dele bate com o tempo desde o mute_v2 dele
+(recusada: 13328 ms; não atendida: 44745 ms), e a recusada aparece como
+"ligação efetuada".
+
+Este commit acrescenta uma opção, por oferta 1:1, do que vai ao relay
+antes do Answer:
+
+  - EarlyMediaFull (padrão): o de hoje, sem mudança;
+  - EarlyMediaHoldRTP: transporte, allocate, keepalive e SRTCP na oferta;
+    RTP de áudio só depois do Answer;
+  - EarlyMediaHoldRTPAndRTCP: transporte, allocate e keepalive na oferta;
+    nem RTP nem SRTCP até o Answer;
+  - EarlyMediaOff: nada antes do Answer (o comportamento de antes do #43,
+    para controle).
+
+Nos três modos não padrão, se o mute_v2 de quem liga não chegar em 3 s
+depois do Answer, o <accept> sai mesmo assim (aviso no log). O primeiro RTP
+enviado, o primeiro SR e o primeiro RTP recebido passam a logar
+since_offer_ms/since_answer_ms (Warn nos modos experimentais). O sendAccept
+passa pelo seam transmitCallNode (o mesmo SendNode do whatsmeow), para o
+teste ver o accept.
+
+Testes: early_media_hold_test.go — a mídia real contra relay local
+(fakeRelay) conta STUN/RTP/RTCP antes e depois do Answer em cada modo;
+accept no mute_v2 depois do Answer, fallback sem mute_v2, nenhum fallback
+no padrão. NÃO diz como o relay do WhatsApp nem o celular reagem — isso é
+a chamada real.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ client.go                |   3 +
+ early_media_hold_test.go | 381 +++++++++++++++++++++++++++++++++++++++
+ engine.go                |  93 +++++++++-
+ engine_media.go          | 100 +++++++++-
+ logging.go               |  54 ++++++
+ 5 files changed, 622 insertions(+), 9 deletions(-)
+ create mode 100644 early_media_hold_test.go
+
+diff --git a/client.go b/client.go
+index 1b668d8..08dbcce 100644
+--- a/client.go
++++ b/client.go
+@@ -26,6 +26,8 @@ type Client struct {
+ 
+ 	offerGate func(Offer) bool
+ 
++	earlyMedia func(Offer) EarlyMediaMode
++
+ 	getGroupInfo func(context.Context, types.JID) (*types.GroupInfo, error)
+ 	ownGroupJIDs func() []types.JID
+ 
+@@ -56,6 +58,7 @@ func NewClient(wa *whatsmeow.Client, opts ...Option) *Client {
+ 	c := &Client{
+ 		wa: wa, log: cfg.log, diag: cfg.diag,
+ 		offerGate:    cfg.offerGate,
++		earlyMedia:   cfg.earlyMedia,
+ 		getGroupInfo: wa.GetGroupInfo,
+ 		ownGroupJIDs: func() []types.JID {
+ 			return []types.JID{wa.Store.GetJID(), wa.Store.GetLID()}
+diff --git a/early_media_hold_test.go b/early_media_hold_test.go
+new file mode 100644
+index 0000000..1af330e
+--- /dev/null
++++ b/early_media_hold_test.go
+@@ -0,0 +1,381 @@
++package meowcaller
++
++import (
++	"context"
++	"crypto/rand"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/purpshell/meowcaller/relay"
++	waBinary "go.mau.fi/whatsmeow/binary"
++)
++
++// lugwave (experimental): tests of WithInboundEarlyMedia — what an inbound 1:1
++// call sends to the relay before Answer in each EarlyMediaMode. The media loop
++// runs for real (relay transport, allocate, MLow, SRTP/SRTCP) against a local
++// relay speaking the same transport stack (fakeRelay, relay_fanout_test.go); what
++// these tests cannot say is how WhatsApp's relays or the caller's phone react.
++
++func TestEarlyMediaModeNames(t *testing.T) {
++	for mode, want := range map[EarlyMediaMode]string{
++		EarlyMediaFull: "full", EarlyMediaHoldRTP: "hold_rtp",
++		EarlyMediaHoldRTPAndRTCP: "hold_rtp_rtcp", EarlyMediaOff: "off",
++		EarlyMediaMode(99): "unknown",
++	} {
++		if got := mode.String(); got != want {
++			t.Errorf("%d.String() = %q, want %q", mode, got, want)
++		}
++	}
++	if EarlyMediaFull.holdsOutbound() || EarlyMediaOff.holdsOutbound() ||
++		!EarlyMediaHoldRTP.holdsOutbound() || !EarlyMediaHoldRTPAndRTCP.holdsOutbound() {
++		t.Fatal("holdsOutbound: only the two hold modes hold the outbound audio")
++	}
++}
++
++func TestWithInboundEarlyMediaReachesTheClient(t *testing.T) {
++	var asked Offer
++	cfg := resolveConfig([]Option{WithInboundEarlyMedia(func(o Offer) EarlyMediaMode {
++		asked = o
++		return EarlyMediaHoldRTPAndRTCP
++	})})
++	if cfg.earlyMedia == nil {
++		t.Fatal("WithInboundEarlyMedia did not set the config")
++	}
++	if got := cfg.earlyMedia(Offer{CallID: "CID"}); got != EarlyMediaHoldRTPAndRTCP || asked.CallID != "CID" {
++		t.Fatalf("earlyMedia = %v (asked %q)", got, asked.CallID)
++	}
++}
++
++// relayTally counts, by kind, what one fake relay got from the library.
++type relayTally struct {
++	mu                   sync.Mutex
++	stun, rtp, rtcp, oth int
++}
++
++func (r *relayTally) snapshot() (stun, rtp, rtcp int) {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	return r.stun, r.rtp, r.rtcp
++}
++
++func tallyRelay(fr *fakeRelay, stop <-chan struct{}) *relayTally {
++	tl := &relayTally{}
++	go func() {
++		for {
++			select {
++			case <-stop:
++				return
++			case p := <-fr.got:
++				tl.mu.Lock()
++				switch relay.ClassifyRelayPacket(p) {
++				case relay.RelayPacketStun:
++					tl.stun++
++				case relay.RelayPacketRtp:
++					tl.rtp++
++				case relay.RelayPacketRtcp:
++					tl.rtcp++
++				default:
++					tl.oth++
++				}
++				tl.mu.Unlock()
++			}
++		}
++	}()
++	return tl
++}
++
++// earlyMediaEngine is an inbound 1:1 call, ringing, in mode, whose offer carried a
++// relay pointing at fr and a callKey — the state onOffer leaves before it calls
++// maybeStartMedia. Stanzas go to a counter (the fallback accept).
++func earlyMediaEngine(t *testing.T, fr *fakeRelay, mode EarlyMediaMode) (*engine, *Call, *int) {
++	t.Helper()
++	eng, call, _ := testEngineWithIncomingCall()
++	var mu sync.Mutex
++	sent := new(int)
++	eng.sendCallNode = func(context.Context, waBinary.Node) error {
++		mu.Lock()
++		*sent++
++		mu.Unlock()
++		return nil
++	}
++	key := make([]byte, 32)
++	if _, err := rand.Read(key); err != nil {
++		t.Fatal(err)
++	}
++	m := eng.calls["CID"]
++	m.callKey = key
++	m.selfLID = "333333333333333:7@lid"
++	m.peerLID = "222222222222222@lid"
++	m.relay = &relayData{
++		relayKeyASCII: []byte("relay-key"),
++		relayTokens:   [][]byte{[]byte("token-0")},
++		endpoints: []relayEndpoint{{
++			relayName: "local", tokenID: 0,
++			addresses: []relayAddress{{ipv4: "127.0.0.1", port: uint16(fr.addr.Port)}},
++		}},
++	}
++	m.earlyMode = mode
++	m.offerAt = time.Now()
++	if mode.holdsOutbound() {
++		m.txRelease = make(chan struct{})
++	}
++	t.Cleanup(func() { eng.finishCall("CID", "test_done") })
++	return eng, call, sent
++}
++
++// ringThenAnswer brings media up as onOffer does and lets the call ring for d (longer
++// than the 1.5 s SRTCP period), then returns what the relay got.
++func ringThenAnswer(t *testing.T, mode EarlyMediaMode) (before, after [3]int, relayUp bool) {
++	t.Helper()
++	fr := startFakeRelay(t)
++	stop := make(chan struct{})
++	defer close(stop)
++	tl := tallyRelay(fr, stop)
++	eng, call, _ := earlyMediaEngine(t, fr, mode)
++
++	eng.maybeStartMedia("CID")
++	time.Sleep(2200 * time.Millisecond)
++	before[0], before[1], before[2] = tl.snapshot()
++	select {
++	case <-fr.ready:
++		relayUp = true
++	default:
++	}
++
++	if err := eng.answer(call); err != nil {
++		t.Fatalf("answer: %v", err)
++	}
++	time.Sleep(2200 * time.Millisecond)
++	s, r, c := tl.snapshot()
++	after = [3]int{s - before[0], r - before[1], c - before[2]}
++	return before, after, relayUp
++}
++
++// The default (upstream #43) sends audio RTP and SRTCP while ringing — the packets
++// the caller's phone counts as a connected call.
++func TestEarlyMediaFullSendsAudioWhileRinging(t *testing.T) {
++	t.Parallel()
++	before, after, up := ringThenAnswer(t, EarlyMediaFull)
++	if !up || before[0] == 0 {
++		t.Fatalf("relay up=%v stun=%d: the transport and the allocate must start on the offer", up, before[0])
++	}
++	if before[1] == 0 || before[2] == 0 {
++		t.Fatalf("while ringing rtp=%d rtcp=%d: the default sends both", before[1], before[2])
++	}
++	if after[1] == 0 {
++		t.Fatal("no RTP after Answer")
++	}
++}
++
++// Variant B: the transport, the allocate+ping keepalive and the SRTCP sender
++// reports start on the offer; audio RTP only after Answer.
++func TestEarlyMediaHoldRTPSendsNoAudioUntilAnswer(t *testing.T) {
++	t.Parallel()
++	before, after, up := ringThenAnswer(t, EarlyMediaHoldRTP)
++	if !up || before[0] < 2 {
++		t.Fatalf("relay up=%v stun=%d: transport, allocate and ping must start on the offer", up, before[0])
++	}
++	if before[1] != 0 {
++		t.Fatalf("%d RTP packet(s) sent while ringing, want none", before[1])
++	}
++	if before[2] == 0 {
++		t.Fatal("hold_rtp keeps the SRTCP sender reports while ringing; none was sent")
++	}
++	if after[1] == 0 || after[2] == 0 {
++		t.Fatalf("after Answer rtp=%d rtcp=%d: both must flow", after[1], after[2])
++	}
++}
++
++// Variant A: only the transport and the allocate+ping keepalive while ringing;
++// neither audio RTP nor SRTCP until Answer, both right after.
++func TestEarlyMediaHoldRTPAndRTCPSendsOnlySTUNUntilAnswer(t *testing.T) {
++	t.Parallel()
++	before, after, up := ringThenAnswer(t, EarlyMediaHoldRTPAndRTCP)
++	if !up || before[0] < 2 {
++		t.Fatalf("relay up=%v stun=%d: transport, allocate and ping must start on the offer", up, before[0])
++	}
++	if before[1] != 0 || before[2] != 0 {
++		t.Fatalf("while ringing rtp=%d rtcp=%d, want none of either", before[1], before[2])
++	}
++	if after[1] == 0 || after[2] == 0 {
++		t.Fatalf("after Answer rtp=%d rtcp=%d: both must flow", after[1], after[2])
++	}
++}
++
++// Variant C (control, the behavior before #43): nothing reaches the relay before
++// Answer — not even the transport; media starts on Answer.
++func TestEarlyMediaOffStartsNothingUntilAnswer(t *testing.T) {
++	t.Parallel()
++	before, after, up := ringThenAnswer(t, EarlyMediaOff)
++	if up || before != [3]int{} {
++		t.Fatalf("while ringing relay up=%v got stun/rtp/rtcp=%v, want nothing", up, before)
++	}
++	if after[0] == 0 || after[1] == 0 {
++		t.Fatalf("after Answer stun/rtp/rtcp=%v: media must start on Answer", after)
++	}
++}
++
++// A relaylatency/transport carrying relay data reaches maybeStartMedia too
++// (onRelay); EarlyMediaOff must refuse it while ringing, like the offer.
++func TestEarlyMediaOffRefusesRelayStartWhileRinging(t *testing.T) {
++	eng, _, _ := testEngineWithIncomingCall()
++	m := eng.calls["CID"]
++	m.earlyMode = EarlyMediaOff
++	m.callKey = []byte("k")
++	m.relay = &relayData{}
++	eng.maybeStartMedia("CID")
++	if m.started {
++		t.Fatal("EarlyMediaOff started media before Answer")
++	}
++}
++
++// Answer releases the hold once; a second Answer must not close the channel again.
++func TestEarlyMediaAnswerReleasesTheHoldOnce(t *testing.T) {
++	old := acceptFallbackDelay
++	acceptFallbackDelay = time.Hour
++	defer func() { acceptFallbackDelay = old }()
++
++	eng, call, _ := testEngineWithIncomingCall()
++	m := eng.calls["CID"]
++	m.earlyMode = EarlyMediaHoldRTPAndRTCP
++	m.txRelease = make(chan struct{})
++	if err := eng.answer(call); err != nil {
++		t.Fatalf("answer: %v", err)
++	}
++	select {
++	case <-m.txRelease:
++	default:
++		t.Fatal("Answer did not release the held audio")
++	}
++	if !m.txReleased || m.answeredAt.IsZero() {
++		t.Fatalf("txReleased=%v answeredAt=%v", m.txReleased, m.answeredAt)
++	}
++	if err := eng.answer(call); err != nil { // would panic on a double close
++		t.Fatalf("second answer: %v", err)
++	}
++}
++
++func muteV2Node() *waBinary.Node {
++	return &waBinary.Node{
++		Tag:   "call",
++		Attrs: waBinary.Attrs{"from": peerJID(), "id": "N1"},
++		Content: []waBinary.Node{{Tag: "mute_v2", Attrs: waBinary.Attrs{
++			"call-id": "CID", "call-creator": creatorJID(), "mute-state": "0",
++		}}},
++	}
++}
++
++// acceptCounter counts the <accept> stanzas put on the wire.
++func acceptCounter(eng *engine) func() int {
++	var mu sync.Mutex
++	n := 0
++	eng.sendCallNode = func(_ context.Context, node waBinary.Node) error {
++		for _, kid := range node.GetChildren() {
++			if kid.Tag == "accept" {
++				mu.Lock()
++				n++
++				mu.Unlock()
++			}
++		}
++		return nil
++	}
++	return func() int {
++		mu.Lock()
++		defer mu.Unlock()
++		return n
++	}
++}
++
++// With the audio held the caller's mute_v2 comes after Answer (the pre-#43
++// order) and the accept goes out from it — once, the fallback stays quiet.
++func TestEarlyMediaHoldAcceptsOnMuteV2AfterAnswer(t *testing.T) {
++	old := acceptFallbackDelay
++	acceptFallbackDelay = 50 * time.Millisecond
++	defer func() { acceptFallbackDelay = old }()
++
++	eng, call, _ := testEngineWithIncomingCall()
++	accepts := acceptCounter(eng)
++	m := eng.calls["CID"]
++	m.earlyMode = EarlyMediaHoldRTPAndRTCP
++	m.txRelease = make(chan struct{})
++	if err := eng.answer(call); err != nil {
++		t.Fatalf("answer: %v", err)
++	}
++	if accepts() != 0 {
++		t.Fatal("accept sent before the caller's mute_v2")
++	}
++	eng.onCallRaw(muteV2Node())
++	if accepts() != 1 {
++		t.Fatalf("accepts after mute_v2 = %d, want 1", accepts())
++	}
++	time.Sleep(150 * time.Millisecond)
++	if accepts() != 1 {
++		t.Fatalf("accepts after the fallback delay = %d, want still 1", accepts())
++	}
++}
++
++// No mute_v2 at all: the fallback sends the accept, once.
++func TestEarlyMediaHoldFallbackAcceptsWithoutMuteV2(t *testing.T) {
++	old := acceptFallbackDelay
++	acceptFallbackDelay = 50 * time.Millisecond
++	defer func() { acceptFallbackDelay = old }()
++
++	eng, call, _ := testEngineWithIncomingCall()
++	accepts := acceptCounter(eng)
++	m := eng.calls["CID"]
++	m.earlyMode = EarlyMediaHoldRTP
++	m.txRelease = make(chan struct{})
++	if err := eng.answer(call); err != nil {
++		t.Fatalf("answer: %v", err)
++	}
++	deadline := time.Now().Add(2 * time.Second)
++	for accepts() == 0 && time.Now().Before(deadline) {
++		time.Sleep(10 * time.Millisecond)
++	}
++	if accepts() != 1 {
++		t.Fatalf("fallback accepts = %d, want 1", accepts())
++	}
++	eng.onCallRaw(muteV2Node()) // a late mute_v2 must not send a second accept
++	time.Sleep(100 * time.Millisecond)
++	if accepts() != 1 {
++		t.Fatalf("accepts after a late mute_v2 = %d, want 1", accepts())
++	}
++}
++
++// The default mode keeps its behavior: no fallback — without a mute_v2 the accept
++// waits for it, as before.
++func TestEarlyMediaFullHasNoAcceptFallback(t *testing.T) {
++	old := acceptFallbackDelay
++	acceptFallbackDelay = 20 * time.Millisecond
++	defer func() { acceptFallbackDelay = old }()
++
++	eng, call, _ := testEngineWithIncomingCall()
++	accepts := acceptCounter(eng)
++	if err := eng.answer(call); err != nil {
++		t.Fatalf("answer: %v", err)
++	}
++	time.Sleep(120 * time.Millisecond)
++	if accepts() != 0 {
++		t.Fatalf("default mode sent %d accept(s) without a mute_v2", accepts())
++	}
++}
++
++// A call that ended before the fallback fires gets no accept.
++func TestEarlyMediaFallbackSkipsAnEndedCall(t *testing.T) {
++	old := acceptFallbackDelay
++	acceptFallbackDelay = 50 * time.Millisecond
++	defer func() { acceptFallbackDelay = old }()
++
++	eng, call, _ := testEngineWithIncomingCall()
++	accepts := acceptCounter(eng)
++	eng.calls["CID"].earlyMode = EarlyMediaHoldRTPAndRTCP
++	if err := eng.answer(call); err != nil {
++		t.Fatalf("answer: %v", err)
++	}
++	eng.finishCall("CID", "hangup")
++	time.Sleep(150 * time.Millisecond)
++	if accepts() != 0 {
++		t.Fatalf("accept sent for an ended call: %d", accepts())
++	}
++}
+diff --git a/engine.go b/engine.go
+index 97b418b..501d1b6 100644
+--- a/engine.go
++++ b/engine.go
+@@ -92,6 +92,16 @@ type engineCall struct {
+ 	earlyMuteCreator types.JID
+ 	inboundSeen      bool
+ 	answered         bool
++
++	// lugwave (experimental): what an inbound 1:1 call sends before Answer
++	// (WithInboundEarlyMedia). txRelease is non-nil while audio RTP (and, in
++	// EarlyMediaHoldRTPAndRTCP, SRTCP) is held; Answer closes it once
++	// (txReleased). offerAt/answeredAt time the logs.
++	earlyMode  EarlyMediaMode
++	txRelease  chan struct{}
++	txReleased bool
++	offerAt    time.Time
++	answeredAt time.Time
+ }
+ 
+ // newEngine creates the engine for a Client.
+@@ -563,13 +573,13 @@ func (e *engine) onOffer(ev *events.CallOffer) {
+ 		e.c.log.Warn().Err(groupErr).Str("call_id", ev.CallID).Msg("parse inbound group offer failed")
+ 		return
+ 	}
++	offer := Offer{
++		CallID: ev.CallID, From: ev.From, Creator: ev.CallCreator,
++		Group: isGroup, Video: signaling.OfferHasVideo(ev.Data),
++	}
+ 	// The gate runs before anything is decrypted or sent: a refused offer leaves this
+ 	// device exactly as silent as a whatsmeow client without a call stack.
+ 	if gate := e.c.offerGate; gate != nil {
+-		offer := Offer{
+-			CallID: ev.CallID, From: ev.From, Creator: ev.CallCreator,
+-			Group: isGroup, Video: signaling.OfferHasVideo(ev.Data),
+-		}
+ 		if !gate(offer) {
+ 			e.c.log.Debug().Str("call_id", ev.CallID).Msg("offer refused by the offer gate; not engaging")
+ 			return
+@@ -634,10 +644,19 @@ func (e *engine) onOffer(ev *events.CallOffer) {
+ 		relay = parseRelayData(r)
+ 	}
+ 	codec, hasCodec := e.voipSettingsCodec(ev.Data, ev.CallID)
++	earlyMode := EarlyMediaFull
++	if fn := e.c.earlyMedia; fn != nil {
++		earlyMode = fn(offer)
++	}
+ 
+ 	e.mu.Lock()
+ 	m := e.entry(ev.CallID)
+ 	m.call = call
++	m.earlyMode = earlyMode
++	m.offerAt = time.Now()
++	if earlyMode.holdsOutbound() {
++		m.txRelease = make(chan struct{})
++	}
+ 	m.callKey = callKey
+ 	m.selfLID = selfLID.String()
+ 	m.peerLID = peer.String()
+@@ -675,6 +694,11 @@ func (e *engine) onOffer(ev *events.CallOffer) {
+ 		e.c.log.Warn().Err(err).Str("call_id", ev.CallID).Msg("preaccept failed")
+ 	}
+ 
++	if earlyMode != EarlyMediaFull {
++		e.c.log.Warn().Str("call_id", ev.CallID).Str("early_media", earlyMode.String()).
++			Msg("EXPERIMENT inbound early media mode is not the default")
++	}
++	// EarlyMediaOff: maybeStartMedia itself refuses a ringing inbound call.
+ 	e.maybeStartMedia(ev.CallID)
+ 
+ 	if fn := e.c.incomingCallHandler(); fn != nil {
+@@ -773,13 +797,34 @@ func (e *engine) answer(c *Call) error {
+ 	e.mu.Lock()
+ 	m.acceptPending = true
+ 	m.answered = true
++	m.answeredAt = time.Now()
+ 	muteSeen, from, creator, inbound := m.earlyMuteSeen, m.earlyMuteFrom, m.earlyMuteCreator, m.inboundSeen
++	earlyMode, offerAt := m.earlyMode, m.offerAt
++	released := false
++	if m.txRelease != nil && !m.txReleased {
++		close(m.txRelease)
++		m.txReleased = true
++		released = true
++	}
++	offerFrom, offerCreator := m.from, m.creator
+ 	e.mu.Unlock()
++	if released {
++		e.c.log.Warn().Str("call_id", c.id).Str("early_media", earlyMode.String()).
++			Int64("since_offer_ms", time.Since(offerAt).Milliseconds()).
++			Bool("mute_v2_seen", muteSeen).
++			Msg("EXPERIMENT outbound audio released on Answer")
++	}
+ 
+ 	e.maybeStartMedia(c.id)
+ 	if muteSeen {
+ 		e.c.log.Info().Str("call_id", c.id).Msg("mute_v2 arrived while ringing; sending accept")
+ 		e.sendAccept(c.id, from, creator)
++	} else if earlyMode != EarlyMediaFull {
++		// With the early media held (or off), the caller's <mute_v2> is expected right
++		// after our audio reaches it, and the deferred <accept> goes out from there
++		// (onCallRaw) — the pre-#43 order. If it never comes, do not leave the call
++		// unaccepted: send the <accept> anyway, and say so.
++		e.armAcceptFallback(c.id, offerFrom, offerCreator, earlyMode)
+ 	}
+ 	if inbound {
+ 		c.setPhase(CallPhaseActive)
+@@ -790,6 +835,40 @@ func (e *engine) answer(c *Call) error {
+ 	return nil
+ }
+ 
++// acceptFallbackDelay is how long Answer waits for the caller's <mute_v2> before
++// sending the deferred <accept> on its own, in the experimental early media modes.
++// A variable so the tests can shorten it.
++var acceptFallbackDelay = 3 * time.Second
++
++// armAcceptFallback sends the deferred <accept> if it is still pending
++// acceptFallbackDelay after Answer (no <mute_v2> came). sendAccept is idempotent: the
++// mute_v2 path and this one cannot both send it.
++func (e *engine) armAcceptFallback(callID string, to, creator types.JID, mode EarlyMediaMode) {
++	time.AfterFunc(acceptFallbackDelay, func() {
++		defer e.recoverMedia("accept fallback", callID)
++		e.mu.Lock()
++		m := e.calls[callID]
++		pending := m != nil && m.acceptPending
++		e.mu.Unlock()
++		if !pending {
++			return
++		}
++		e.c.log.Warn().Str("call_id", callID).Str("early_media", mode.String()).
++			Dur("after", acceptFallbackDelay).
++			Msg("EXPERIMENT no mute_v2 after Answer; sending the deferred accept anyway")
++		e.sendAccept(callID, to, creator)
++	})
++}
++
++// acceptRequestID is the id of a callee <accept>: whatsmeow's request id, as before;
++// a random one when there is no whatsmeow client (tests).
++func (e *engine) acceptRequestID() string {
++	if e.c != nil && e.c.wa != nil {
++		return e.c.wa.DangerousInternals().GenerateRequestID()
++	}
++	return e.nextCallNodeID()
++}
++
+ // sendAccept sends the deferred callee <accept> (once), in the WA-Web format (metadata +
+ // single rate — the peer keeps the call alive with this; capability+both-rates fails).
+ func (e *engine) sendAccept(callID string, to, creator types.JID) {
+@@ -809,8 +888,10 @@ func (e *engine) sendAccept(callID string, to, creator types.JID) {
+ 		Metadata:   waBinary.Attrs{"peer_abtest_bucket_id_list": "125208,94276"},
+ 		Video:      isVideo,
+ 	})
+-	accept.Attrs["id"] = e.c.wa.DangerousInternals().GenerateRequestID()
+-	if err := e.c.wa.DangerousInternals().SendNode(context.Background(), accept); err != nil {
++	accept.Attrs["id"] = e.acceptRequestID()
++	// transmitCallNode is whatsmeow's SendNode (newEngine), the same call as before,
++	// through the engine's seam so a test can see the accept.
++	if err := e.transmitCallNode(context.Background(), accept); err != nil {
+ 		e.c.log.Error().Err(err).Str("call_id", callID).Msg("send accept failed")
+ 		return
+ 	}
+diff --git a/engine_media.go b/engine_media.go
+index 5ce6d8e..3c6befa 100644
+--- a/engine_media.go
++++ b/engine_media.go
+@@ -48,6 +48,12 @@ func (e *engine) maybeStartMedia(callID string) {
+ 		e.mu.Unlock()
+ 		return
+ 	}
++	// lugwave (experimental): EarlyMediaOff keeps an inbound 1:1 call off the relay
++	// until Answer, whatever else (a relaylatency/transport with relay data) arrives.
++	if !m.group && m.direction == CallDirectionIncoming && m.earlyMode == EarlyMediaOff && !m.answered {
++		e.mu.Unlock()
++		return
++	}
+ 	if m.group && (!m.hasGroupEpoch || len(m.groupRawEpoch) != 32 ||
+ 		m.groupUpdate == nil || m.groupUpdate.Relay == nil) {
+ 		e.c.log.Debug().
+@@ -288,10 +294,28 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
+ 	}
+ 	e.mu.Lock()
+ 	isGroup := false
++	// lugwave (experimental): txHold is closed by Answer; nil = nothing held
++	// (the default, an outbound/group call, or a media start after Answer).
++	var txHold <-chan struct{}
++	earlyMode := EarlyMediaFull
++	var offerAt time.Time
+ 	if mm := e.calls[callID]; mm != nil {
+ 		isGroup = mm.group
++		earlyMode, offerAt = mm.earlyMode, mm.offerAt
++		if mm.txRelease != nil && !mm.txReleased {
++			txHold = mm.txRelease
++		}
+ 	}
+ 	e.mu.Unlock()
++	rtcpHold := txHold
++	if earlyMode != EarlyMediaHoldRTPAndRTCP {
++		rtcpHold = nil
++	}
++	if txHold != nil {
++		log.Warn().Str("call_id", callID).Str("early_media", earlyMode.String()).
++			Bool("srtcp_held", rtcpHold != nil).
++			Msg("EXPERIMENT relay transport, allocate and keepalive start now; outbound audio RTP waits for Answer")
++	}
+ 
+ 	ch, err := e.connectAndAllocateAll(ctx, rd, streamSsrcs, inbound, !isGroup)
+ 	if err != nil {
+@@ -650,12 +674,24 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
+ 		ticker := time.NewTicker(frameInterval)
+ 		defer ticker.Stop()
+ 		var txCount uint64
++		hold := txHold
+ 		for {
+ 			select {
+ 			case <-ctx.Done():
+ 				return
+ 			case <-ticker.C:
+ 			}
++			// lugwave (experimental): while the call rings here, nothing is encoded
++			// or sent; the stream starts fresh (first sequence number, first
++			// timestamp) on the first tick after Answer.
++			if hold != nil {
++				select {
++				case <-hold:
++					hold = nil
++				default:
++					continue
++				}
++			}
+ 			frame := silence
+ 			if player, _ := callPlayerSink(call); player != nil {
+ 				if f := player.nextFrame(); f != nil {
+@@ -678,7 +714,20 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
+ 				return
+ 			}
+ 			if txCount++; txCount == 1 {
+-				log.Info().Int("bytes", len(packet)).Msg("first RTP sent to relay, outbound media flowing")
++				ev := log.Info()
++				if earlyMode != EarlyMediaFull {
++					ev = log.Warn()
++				}
++				ev = ev.Str("call_id", callID).Int("bytes", len(packet)).Str("early_media", earlyMode.String())
++				if !offerAt.IsZero() {
++					ev = ev.Int64("since_offer_ms", time.Since(offerAt).Milliseconds())
++				}
++				if answeredAt := e.callAnsweredAt(callID); !answeredAt.IsZero() {
++					ev = ev.Int64("since_answer_ms", time.Since(answeredAt).Milliseconds())
++				} else if inbound {
++					ev = ev.Bool("before_answer", true)
++				}
++				ev.Msg("first RTP sent to relay, outbound media flowing")
+ 				e.c.diag.Emit("meta", map[string]any{"event": "first_rtp_sent", "call_id": callID, "bytes": len(packet)})
+ 			}
+ 		}
+@@ -827,11 +876,22 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
+ 		ticker := time.NewTicker(1500 * time.Millisecond)
+ 		defer ticker.Stop()
+ 		var sent uint64
++		hold := rtcpHold
+ 		for {
+ 			select {
+ 			case <-ctx.Done():
+ 				return
+ 			case now := <-ticker.C:
++				// lugwave (experimental): EarlyMediaHoldRTPAndRTCP sends no
++				// sender report while the call rings here.
++				if hold != nil {
++					select {
++					case <-hold:
++						hold = nil
++					default:
++						continue
++					}
++				}
+ 				nowMs := uint64(now.UnixMilli())
+ 				e.mu.Lock()
+ 				current := e.calls[callID]
+@@ -878,7 +938,18 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
+ 				}
+ 				sent++
+ 				if sent == 1 {
+-					log.Info().Msg("started periodic SRTCP sender reports")
++					ev := log.Info()
++					if earlyMode != EarlyMediaFull {
++						ev = log.Warn()
++					}
++					ev = ev.Str("call_id", callID).Str("early_media", earlyMode.String())
++					if !offerAt.IsZero() {
++						ev = ev.Int64("since_offer_ms", time.Since(offerAt).Milliseconds())
++					}
++					if e.callAnsweredAt(callID).IsZero() && inbound {
++						ev = ev.Bool("before_answer", true)
++					}
++					ev.Msg("started periodic SRTCP sender reports")
+ 				}
+ 				e.c.diag.Emit("rtcp", map[string]any{
+ 					"event": "sender_reports", "tick": sent,
+@@ -1216,7 +1287,19 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
+ 			audioPlayoutMu.Unlock()
+ 		}
+ 		if rtpIn++; rtpIn == 1 {
+-			log.Info().Msg("first RTP decoded from relay, inbound audio flowing")
++			ev := log.Info().Str("call_id", callID)
++			if earlyMode != EarlyMediaFull {
++				ev = log.Warn().Str("call_id", callID).Str("early_media", earlyMode.String())
++			}
++			if !offerAt.IsZero() {
++				ev = ev.Int64("since_offer_ms", time.Since(offerAt).Milliseconds())
++			}
++			if answeredAt := e.callAnsweredAt(callID); !answeredAt.IsZero() {
++				ev = ev.Int64("since_answer_ms", time.Since(answeredAt).Milliseconds())
++			} else if inbound {
++				ev = ev.Bool("before_answer", true)
++			}
++			ev.Msg("first RTP decoded from relay, inbound audio flowing")
+ 			e.c.diag.Emit("meta", map[string]any{"event": "first_rtp_in", "call_id": callID})
+ 			e.onFirstInboundRTP(callID, call)
+ 		}
+@@ -1680,3 +1763,14 @@ func (e *engine) onFirstInboundRTP(callID string, call *Call) {
+ 		}
+ 	}
+ }
++
++// callAnsweredAt is when Answer ran for callID (zero if it did not, or the call is
++// gone). lugwave (experimental), for the early media logs.
++func (e *engine) callAnsweredAt(callID string) time.Time {
++	e.mu.Lock()
++	defer e.mu.Unlock()
++	if m := e.calls[callID]; m != nil {
++		return m.answeredAt
++	}
++	return time.Time{}
++}
+diff --git a/logging.go b/logging.go
+index 94ea396..3584a56 100644
+--- a/logging.go
++++ b/logging.go
+@@ -16,6 +16,8 @@ type config struct {
+ 	diag *diag.Recorder
+ 
+ 	offerGate func(Offer) bool
++
++	earlyMedia func(Offer) EarlyMediaMode
+ }
+ 
+ func resolveConfig(opts []Option) config {
+@@ -64,3 +66,55 @@ type Offer struct {
+ func WithOfferGate(fn func(Offer) bool) Option {
+ 	return func(c *config) { c.offerGate = fn }
+ }
++
++// EarlyMediaMode says what an inbound 1:1 call sends to the relay while it is still
++// ringing here, before Answer. EXPERIMENTAL (lugwave): the default is the upstream
++// PR #43 behavior; the other modes exist to measure, with real calls, which of the
++// early packets makes the caller's phone count the call as connected.
++type EarlyMediaMode int
++
++const (
++	// EarlyMediaFull is the default (PR #43): from the offer the library connects
++	// the relays, allocates, pings and sends audio RTP (silence) and SRTCP sender
++	// reports. The caller's phone starts its call clock (audio_duration) on that
++	// media, before Answer.
++	EarlyMediaFull EarlyMediaMode = iota
++	// EarlyMediaHoldRTP connects, allocates, pings and sends SRTCP sender reports
++	// from the offer, but no audio RTP until Answer.
++	EarlyMediaHoldRTP
++	// EarlyMediaHoldRTPAndRTCP connects, allocates and pings from the offer (the
++	// relay transport and the 1 Hz allocate+ping keepalive), but sends neither
++	// audio RTP nor SRTCP until Answer. Inbound packets are still read and decoded.
++	EarlyMediaHoldRTPAndRTCP
++	// EarlyMediaOff starts no media before Answer: the behavior before PR #43
++	// (expected: the call clock is right, but a late Answer gets no inbound audio).
++	EarlyMediaOff
++)
++
++// String returns the mode's stable name, as logged.
++func (m EarlyMediaMode) String() string {
++	switch m {
++	case EarlyMediaFull:
++		return "full"
++	case EarlyMediaHoldRTP:
++		return "hold_rtp"
++	case EarlyMediaHoldRTPAndRTCP:
++		return "hold_rtp_rtcp"
++	case EarlyMediaOff:
++		return "off"
++	}
++	return "unknown"
++}
++
++// holdsOutbound reports whether audio RTP waits for Answer in this mode.
++func (m EarlyMediaMode) holdsOutbound() bool {
++	return m == EarlyMediaHoldRTP || m == EarlyMediaHoldRTPAndRTCP
++}
++
++// WithInboundEarlyMedia chooses, per inbound 1:1 offer, what is sent before Answer
++// (see EarlyMediaMode). fn runs on whatsmeow's event dispatch, after the offer gate:
++// keep it short. Without it every call uses EarlyMediaFull. Group calls and outbound
++// calls are not affected.
++func WithInboundEarlyMedia(fn func(Offer) EarlyMediaMode) Option {
++	return func(c *config) { c.earlyMedia = fn }
++}
+-- 
+2.43.0
+

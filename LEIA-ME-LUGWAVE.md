@@ -407,3 +407,19 @@ não fica aqui. Conserto que entra lá é conserto que não mantemos. A mediçã
 acima é material para comentar no #26 e no #43.
 
 Ver `docs/upstreams.md` no monorepo do CRM.
+
+## Branch experimental `exp/segurar-audio-ate-atender` (17/10/2026)
+
+**Não é a `whatsmeow-base`** e não é consumida pela `develop` do CRM: só pela
+branch `exp/calls-qr-audio-ate-atender` do `lugwave/crm`, para A/B com chamada
+real. É a `whatsmeow-base` da tag `lugwave-v0.0.4` mais um patch nosso,
+`0009-lugwave-exp-audio-ate-atender.patch`: `WithInboundEarlyMedia`, que
+escolhe por oferta o que vai ao relay antes do `Answer()` (padrão: tudo, como
+o #43; `HoldRTP`; `HoldRTPAndRTCP`; `Off`, o de antes do #43). Motivo: com o
+#43 o celular de quem liga conta a chamada como conectada desde ~0,7 s depois
+da oferta (o `audio_duration` bate com o `mute_v2` dele) — a recusada vira
+"ligação efetuada". O topo desta branch tem a tag
+`lugwave-exp-audio-ate-atender-1`, para a pseudo-versão pinada continuar
+resolvendo. Se uma variante passar na chamada real, o patch entra na
+`whatsmeow-base` pelo caminho normal (arquivo em `patches-lugwave/`,
+regeneração, tag nova); se nenhuma passar, a branch morre.
