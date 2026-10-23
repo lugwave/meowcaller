@@ -436,6 +436,15 @@ O script, rodado a partir da `main`:
 
 A versão do whatsmeow tem de ser a mesma que `apps/api/go.mod` do CRM pina.
 
+Subir só o whatsmeow, sem regenerar, também é commit comum no topo da
+`whatsmeow-base`: `go mod edit -require=go.mau.fi/whatsmeow@<versão>`, `go mod
+tidy`, build, vet e `go test -race ./...`, tag nova — foi assim em 23/10/2026
+(0722 → `b2b1e71`). Na `main`, troque junto o padrão do
+`regenerar-base-whatsmeow.sh`, para a próxima regeneração não voltar à versão
+velha. Os comentários `Source of truth` do código apontam para permalinks do
+whatsmeow no commit em que o upstream os escreveu: não são a versão pinada, e
+não se mexe neles.
+
 Regenerar recria a branch, então publicá-la é um `git push -f origin
 whatsmeow-base`. **Antes disso, todo commit que algum `go.mod` do CRM pina tem
 de ter tag**: a pseudo-versão só resolve (fora do cache do proxy) enquanto o
@@ -451,6 +460,7 @@ As tags são `lugwave-v0.0.N`, uma por topo que o CRM pinou, em ordem:
 | `lugwave-v0.0.3` | `26f53bf` | primeira versão do #3459 do CRM (+ #46, #47, recover e testes) |
 | `lugwave-v0.0.4` | o topo seguinte de 16/10/2026 | #3459 do CRM depois da revisão (+ 0008) |
 | `lugwave-v0.0.5` | o topo de 17/10/2026 | release 1.50.20 do CRM (+ 0009, o áudio espera o `Answer()`) |
+| `lugwave-v0.0.6` | o topo de 23/10/2026 | PR #3646 do CRM (o whatsmeow sobe de 0722 para `b2b1e71`, o `main` de 17/10/2026; nenhum patch muda) |
 
 Fora da sequência, `lugwave-exp-audio-ate-atender-1` segura o topo da branch
 experimental `exp/segurar-audio-ate-atender`, que só a branch homônima do CRM

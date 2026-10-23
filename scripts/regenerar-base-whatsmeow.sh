@@ -37,7 +37,7 @@
 
 set -euo pipefail
 
-WHATSMEOW="${1:-v0.0.0-20260722203353-e9a033b24933}"
+WHATSMEOW="${1:-v0.0.0-20261017175727-b2b1e71d45e2}"
 DE="github.com/polymorfa/hypermeow"
 PARA="go.mau.fi/whatsmeow"
 
