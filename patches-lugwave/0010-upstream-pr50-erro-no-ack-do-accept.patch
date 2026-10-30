@@ -1,0 +1,184 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sanjuniperodee <87779571856b@gmail.com>
+Date: Fri, 30 Oct 2026 21:48:29 +0500
+Subject: [PATCH] =?UTF-8?q?upstream=20#50:=20a=20chamada=20de=20entrada=20?=
+ =?UTF-8?q?j=C3=A1=20atendida=20n=C3=A3o=20cai=20com=20o=20ack=20de=20erro?=
+ =?UTF-8?q?=20do=20<accept>?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+PR upstream: https://github.com/purpshell/meowcaller/pull/50
+  "engine: keep an answered inbound call through an error ack on its
+  accept"
+Head: b3c338029b5b41f27825bb0799dfc955b8d7e850, ABERTO em 30/10/2026,
+separado do #49 a nosso pedido (comentário no #49). Autor original:
+sanjuniperodee (Bekkhan) — a autoria deste commit é dele; aqui só foi
+portado.
+
+O que resolve: num número de WhatsApp Business em coexistência (app +
+Business Platform), o aparelho hospedado da Meta (<lid>:99@hosted.lid)
+recusa toda chamada de entrada vinda de celular (o #47 já impede que esse
+<reject> encerre a chamada). Atendida a chamada, o servidor responde ao
+nosso <accept> com <ack class="call" error="500">, mas quem liga recebeu o
+accept: o celular dele mostra a chamada conectada e fica em
+"reconectando" quando o onCallAck derruba a mídia. Agora o ack de erro de
+uma chamada de entrada 1:1 cujo <accept> já saiu é só logado (código e
+tipo do ack, sem JID); se não chegar áudio de entrada decodificado em 6 s
+(acceptErrorAckGrace), o accept não pegou e a chamada é encerrada com
+server:<código>, como antes. Chamada tocando, de saída e de grupo não
+mudam.
+
+O port, em relação ao diff do PR: o CHANGELOG.md fica de fora (o do fork
+não tem o contexto do hunk); e o bloco novo do engine.go, que no PR vem
+logo depois do answer(), fica depois das funções do 0009
+(armAcceptFallback, acceptRequestID) — conflito só de posição. A goroutine
+do guarda ganha o recover do 0006 no commit seguinte, que é nosso.
+
+Sem medição nossa com chamada real: nenhum número nosso roda coexistência
+com chamada pelo QR. O autor validou ao vivo (Android, iPhone e macOS como
+quem liga); o guarda em si só pelo teste de unidade.
+
+Este commit CAI quando o upstream mergear o #50: a regeneração da base
+(scripts/regenerar-base-whatsmeow.sh) detecta o patch já presente e para,
+pedindo para tirá-lo de patches-lugwave/.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ accept_error_ack_test.go | 22 +++++++++++++++++++
+ engine.go                | 47 ++++++++++++++++++++++++++++++++++++++++
+ engine_media.go          |  3 +++
+ livecall.go              |  5 +++++
+ 4 files changed, 77 insertions(+)
+ create mode 100644 accept_error_ack_test.go
+
+diff --git a/accept_error_ack_test.go b/accept_error_ack_test.go
+new file mode 100644
+index 0000000..2c10681
+--- /dev/null
++++ b/accept_error_ack_test.go
+@@ -0,0 +1,22 @@
++package meowcaller
++
++import (
++	"testing"
++	"time"
++)
++
++func TestAudioSinceErrorAck(t *testing.T) {
++	c := &Call{}
++	ack := time.Now()
++	if audioSince(c, ack) {
++		t.Fatal("no audio yet: must report none")
++	}
++	c.lastInboundAudio.Store(ack.Add(-time.Second).UnixNano())
++	if audioSince(c, ack) {
++		t.Fatal("audio before the ack (early media) must not count")
++	}
++	c.lastInboundAudio.Store(ack.Add(200 * time.Millisecond).UnixNano())
++	if !audioSince(c, ack) {
++		t.Fatal("audio after the ack: the accept landed")
++	}
++}
+diff --git a/engine.go b/engine.go
+index 6c4ffb5..c6a3d71 100644
+--- a/engine.go
++++ b/engine.go
+@@ -874,6 +874,40 @@ func (e *engine) acceptRequestID() string {
+ 	return e.nextCallNodeID()
+ }
+ 
++// acceptErrorAckGrace is how long an answered inbound call kept after an error ack
++// may go without inbound audio before it is ended. Connected peers send audio (or DTX
++// frames, several per second) continuously, so a few seconds is ample.
++var acceptErrorAckGrace = 6 * time.Second
++
++// acceptGoneOut: the inbound call was answered and its <accept> is sent or being sent
++// (answer sets acceptPending, sendAccept clears it right before transmitting).
++func (e *engine) acceptGoneOut(m *engineCall) bool {
++	e.mu.Lock()
++	defer e.mu.Unlock()
++	return !m.acceptPending && m.call != nil && m.call.State() != CallPhaseRinging
++}
++
++// guardAcceptErrorAck ends a call kept after an error ack on its <accept> when no
++// inbound audio has arrived since the ack: the accept did not land after all.
++func (e *engine) guardAcceptErrorAck(callID string, m *engineCall, errCode string, ackAt time.Time) {
++	time.Sleep(acceptErrorAckGrace)
++	if e.lookup(callID) != m {
++		return // already ended (or replaced)
++	}
++	if m.call != nil && audioSince(m.call, ackAt) {
++		e.c.log.Info().Str("call_id", callID).Str("error_code", errCode).Msg("inbound audio after the error ack; the accept landed")
++		return
++	}
++	e.c.log.Warn().Str("call_id", callID).Str("error_code", errCode).Dur("grace", acceptErrorAckGrace).
++		Msg("no inbound audio after the error ack; ending the call")
++	e.finishCall(callID, "server:"+errCode)
++}
++
++// audioSince reports whether the peer's audio was decoded at or after t.
++func audioSince(c *Call, t time.Time) bool {
++	return c.lastInboundAudio.Load() >= t.UnixNano()
++}
++
+ // sendAccept sends the deferred callee <accept> (once), in the WA-Web format (metadata +
+ // single rate — the peer keeps the call alive with this; capability+both-rates fails).
+ func (e *engine) sendAccept(callID string, to, creator types.JID) {
+@@ -1316,6 +1350,19 @@ func (e *engine) onCallAck(ack *waBinary.Node) {
+ 		if en := findChild(ack, "error"); en != nil {
+ 			callID = en.AttrGetter().String("call-id")
+ 		}
++		// An error ack for the <accept> of an inbound 1:1 call we already answered is not
++		// necessarily the end of the call. Seen live: a Meta-hosted companion of the called
++		// account (<lid user>:99@hosted.lid) rejects the offer first; the server then acks
++		// our <accept> with error 500, yet the caller did receive it — their phone shows
++		// the call connected, then "reconnecting" once we tear media down. Keep the call
++		// while the peer's audio flows; if none arrives within acceptErrorAckGrace, the
++		// accept did not land after all and the call is ended.
++		if m := e.lookup(callID); m != nil && !m.group && m.direction == CallDirectionIncoming && e.acceptGoneOut(m) {
++			e.c.log.Warn().Str("call_id", callID).Str("error_code", errCode).Str("ack_type", ack.AttrGetter().OptionalString("type")).
++				Msg("server error ack after our accept; keeping the answered call while audio flows")
++			go e.guardAcceptErrorAck(callID, m, errCode, time.Now())
++			return
++		}
+ 		e.c.log.Warn().Str("call_id", callID).Str("error_code", errCode).Msg("call rejected by server")
+ 		e.finishCall(callID, "server:"+errCode)
+ 		return
+diff --git a/engine_media.go b/engine_media.go
+index fdb5f84..524bdcb 100644
+--- a/engine_media.go
++++ b/engine_media.go
+@@ -1245,6 +1245,9 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
+ 			continue
+ 		}
+ 		audioReception.Observe(audio.SSRC, vh.SequenceNumber, audio.Timestamp, uint64(time.Now().UnixMilli()), SampleRate)
++		if call != nil {
++			call.lastInboundAudio.Store(time.Now().UnixNano())
++		}
+ 		e.c.diag.Emit("rtp", map[string]any{
+ 			"event": "in", "ssrc": audio.SSRC, "seq": vh.SequenceNumber,
+ 			"ts": audio.Timestamp, "pt": vh.PayloadType, "marker": vh.Marker,
+diff --git a/livecall.go b/livecall.go
+index cd444a2..a1b1c20 100644
+--- a/livecall.go
++++ b/livecall.go
+@@ -3,6 +3,7 @@ package meowcaller
+ import (
+ 	"context"
+ 	"sync"
++	"sync/atomic"
+ 	"time"
+ 
+ 	"github.com/purpshell/meowcaller/signaling"
+@@ -16,6 +17,10 @@ type Call struct {
+ 	id   string
+ 	peer types.JID
+ 
++	// lastInboundAudio: when the peer's last authenticated audio frame was decoded
++	// (Unix nanoseconds, 0 = never). Read by the error-ack guard in onCallAck.
++	lastInboundAudio atomic.Int64
++
+ 	mu                        sync.Mutex
+ 	phase                     CallPhase
+ 	player                    *Player

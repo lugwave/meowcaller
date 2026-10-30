@@ -19,8 +19,9 @@ o `main` do upstream com **três camadas** por cima, cada uma em commits própri
 3. **Patches nossos** (um commit cada): o encerrar só local (desde
    12/10/2026), o `recover()` nas goroutines e nos ganchos da lib, os testes
    do código de vários relays e o lock que não fica preso depois de um panic
-   (desde 16/10/2026), e o áudio de saída da chamada recebida esperar o
-   `Answer()` (desde 17/10/2026). Não são PRs do upstream — é
+   (desde 16/10/2026), o áudio de saída da chamada recebida esperar o
+   `Answer()` (desde 17/10/2026) e o `recover()` na goroutine que o #50 sobe
+   (desde 30/10/2026). Não são PRs do upstream — é
    lógica escrita por nós, pequena, e a intenção é propô-la lá. **Aqui a
    lógica também muda.**
 
@@ -50,6 +51,7 @@ depois do 0003 porque foram aplicados por cima dele.
 | 2 | [#43](https://github.com/purpshell/meowcaller/pull/43) | engine.go: start inbound media on the offer so a late answer keeps inbound audio | `8b2a046b6396` | @Michsantozz | `0002-upstream-pr43-midia-na-oferta.patch` |
 | 4 | [#46](https://github.com/purpshell/meowcaller/pull/46) | engine: an offer gate and an exported hook check | `931b695258ec` | @viktorvillalobos | `0004-upstream-pr46-portao-por-oferta.patch` |
 | 5 | [#47](https://github.com/purpshell/meowcaller/pull/47) | engine: a reject from the account's own device does not end an inbound call | `808116a43280` | @viktorvillalobos | `0005-upstream-pr47-reject-de-outro-aparelho.patch` |
+| 10 | [#50](https://github.com/purpshell/meowcaller/pull/50) | engine: keep an answered inbound call through an error ack on its accept | `b3c338029b5b` | @sanjuniperodee | `0010-upstream-pr50-erro-no-ack-do-accept.patch` |
 
 ### #26 — liga todos os relays da oferta
 
@@ -122,6 +124,36 @@ conta inteira chega aos irmãos como `<terminate reason="rejected_elsewhere">`
 (e não como `<reject>`) é o que o CRM supõe e o que a chamada real tem de
 confirmar.
 
+### #50 — a chamada de entrada já atendida não cai com o ack de erro do `<accept>`
+
+Num número de WhatsApp Business em **coexistência** (app + Business Platform), a
+Meta mantém um aparelho hospedado na conta, `<lid>:99@hosted.lid`, que recusa
+**toda** chamada de entrada vinda de celular — o #47 já impede que esse
+`<reject>` encerre a chamada. Atendida a chamada, o servidor responde ao nosso
+`<accept>` com `<ack class="call" error="500">`, mas quem liga **recebeu** o
+accept: o celular dele mostra a chamada conectada e fica em "reconectando"
+quando a lib derruba a mídia (o `onCallAck` encerrava a chamada com qualquer ack
+de erro). Chamada vinda do WhatsApp Desktop de quem liga não é recusada pelo
+aparelho hospedado e não leva o ack de erro.
+
+Agora o ack de erro de uma chamada **de entrada 1:1 cujo `<accept>` já saiu** é
+só logado (código e tipo do ack, sem JID) e a chamada segue. Para o caso
+contrário — o erro querer dizer que o accept não pegou —, um guarda espera
+`acceptErrorAckGrace` (6 s): sem áudio de entrada decodificado depois do ack
+(o de antes não conta), a chamada é encerrada com `server:<código>`, como
+antes. Chamada tocando, de saída e de grupo não mudam. O PR foi separado do #49
+a pedido nosso, com o guarda que sugerimos lá.
+
+Port: o `CHANGELOG.md` fica de fora (o do fork não tem o contexto do hunk), e
+o bloco novo do `engine.go` fica depois das funções do 0009 — conflito só de
+posição. O `recover()` da goroutine do guarda é o patch nosso 0011.
+
+**Riscos:** quem liga no **mudo** na hora do accept pode não mandar áudio nos
+primeiros 6 s, e o guarda encerraria uma chamada que pegou — perguntado no PR.
+**Sem medição nossa com chamada real**: nenhum número nosso roda coexistência
+com chamada pelo QR. O autor validou ao vivo (Android, iPhone e macOS como quem
+liga); o guarda em si, só pelo teste de unidade (`accept_error_ack_test.go`).
+
 ### A medição que justifica carregar os dois (12/10/2026, staging do CRM)
 
 Chamada de voz recebida numa conexão QR, atendida por uma pessoa pela ponte de
@@ -179,9 +211,10 @@ a medição e os riscos.
 | 7 | Testes do código de vários relays: fanout, filtro de replay e filtro de `relaylatency` | Lugwave | `0007-lugwave-testes-relays.patch` |
 | 8 | O lock do engine não fica preso depois de um panic de parse; a guarda não espera por ele para sempre; avisos sem o número | Lugwave | `0008-lugwave-lock-apos-panic.patch` |
 | 9 | O áudio de saída da chamada recebida espera o `Answer()` (`WithInboundEarlyMedia`) | Lugwave | `0009-lugwave-audio-ate-atender.patch` |
+| 11 | `recover()` na goroutine do guarda do #50 | Lugwave | `0011-lugwave-recover-guarda-pr50.patch` |
 
 As seções abaixo até "Por que não adotamos o hypermeow" são do 0003; o 0006, o
-0007, o 0008 e o 0009 estão nas seções seguintes a ele.
+0007, o 0008, o 0009 e o 0011 estão nas seções seguintes a ele.
 
 Aplica depois dos dois PRs (mexe no `engine.onAccept` e no `livecall.go`, que
 eles não tocam nesses pontos).
@@ -403,6 +436,16 @@ Sai quando o upstream tiver o equivalente — o #43 com o áudio segurado até o
 `Answer()`, ou uma opção para isso. **Vale propor no próprio #43**: é a resposta
 à pergunta que deixamos lá ("o que quem liga vê durante o toque").
 
+## 0011 — `recover()` na goroutine do guarda do #50
+
+O #50 sobe uma goroutine por ack de erro (`guardAcceptErrorAck`), que espera 6 s
+e pode encerrar a chamada. Ela ganha o mesmo `defer e.recoverMedia` das outras
+goroutines de uma chamada (0006): um panic ali loga com a pilha e encerra a
+chamada, em vez de derrubar o processo e com ele todas as conexões.
+
+**Critério de saída:** sai junto com o 0010, quando o upstream mergear o #50 —
+ou antes, se o upstream ganhar recover equivalente.
+
 ## Por que não adotamos o hypermeow
 
 Desde 06/09/2026 o meowcaller importa o hypermeow — um fork do whatsmeow, do
@@ -461,6 +504,7 @@ As tags são `lugwave-v0.0.N`, uma por topo que o CRM pinou, em ordem:
 | `lugwave-v0.0.4` | o topo seguinte de 16/10/2026 | #3459 do CRM depois da revisão (+ 0008) |
 | `lugwave-v0.0.5` | o topo de 17/10/2026 | release 1.50.20 do CRM (+ 0009, o áudio espera o `Answer()`) |
 | `lugwave-v0.0.6` | o topo de 23/10/2026 | PR #3646 do CRM (o whatsmeow sobe de 0722 para `b2b1e71`, o `main` de 17/10/2026; nenhum patch muda) |
+| `lugwave-v0.0.7` | o topo de 30/10/2026 | o CRM a partir deste topo (+ #50 e 0011, o ack de erro do `<accept>` na coexistência) |
 
 Fora da sequência, `lugwave-exp-audio-ate-atender-1` segura o topo da branch
 experimental `exp/segurar-audio-ate-atender`, que só a branch homônima do CRM
