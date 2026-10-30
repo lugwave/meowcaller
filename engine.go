@@ -890,6 +890,7 @@ func (e *engine) acceptGoneOut(m *engineCall) bool {
 // guardAcceptErrorAck ends a call kept after an error ack on its <accept> when no
 // inbound audio has arrived since the ack: the accept did not land after all.
 func (e *engine) guardAcceptErrorAck(callID string, m *engineCall, errCode string, ackAt time.Time) {
+	defer e.recoverMedia("accept error-ack guard", callID)
 	time.Sleep(acceptErrorAckGrace)
 	if e.lookup(callID) != m {
 		return // already ended (or replaced)
