@@ -1,0 +1,179 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Luan Luciano <luanluciano93@gmail.com>
+Date: Fri, 6 Nov 2026 00:33:47 +0000
+Subject: [PATCH] =?UTF-8?q?lugwave:=20SRTCP=20de=20um=20SSRC=20fora=20dos?=
+ =?UTF-8?q?=20streams=20da=20chamada=20vai=20para=20Debug=20=E2=80=94=20o?=
+ =?UTF-8?q?=20aviso=20de=20HMAC=20que=20n=C3=A3o=20confere=20fica=20para?=
+ =?UTF-8?q?=20chave=20errada=20de=20verdade?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+O laço de recepção logava `peer SRTCP failed authentication` (Warn) para
+duas coisas diferentes: o pacote cujo SSRC não é de nenhum participante (o
+registry devolve falha sem testar o HMAC) e o pacote de SSRC conhecido cujo
+HMAC não confere. O primeiro foi visto uma vez, com ssrc 1, no aceite da
+primeira chamada de saída real do CRM (12/10/2026): RTCP de fora do plano de
+streams (provavelmente do relay), não chave errada — o RTP, com chaves da
+mesma derivação, autenticou a chamada inteira.
+
+Agora o registry diz por que recusou (`unprotectSRTCP`, com `UnprotectSRTCP`
+mantido por cima): SSRC desconhecido vai para Debug, uma vez, com o evento de
+diagnóstico `unknown_ssrc`; HMAC que não confere num SSRC conhecido segue Warn,
+como antes. Nenhum pacote passa a ser aceito ou descartado de outro jeito.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ engine_media.go            | 19 ++++++++++--
+ group_media_receive.go     | 25 ++++++++++++++--
+ srtcp_unknown_ssrc_test.go | 61 ++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 100 insertions(+), 5 deletions(-)
+ create mode 100644 srtcp_unknown_ssrc_test.go
+
+diff --git a/engine_media.go b/engine_media.go
+index 524bdcb..98d06db 100644
+--- a/engine_media.go
++++ b/engine_media.go
+@@ -956,7 +956,7 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
+ 
+ 	buf := make([]byte, 1500)
+ 	rtpDedup := newRtpReplayFilter()
+-	var rtpIn, rtpSeen, unprotectFail, rtpInspect, vidIn, appDataIn, appDataUnprotectFail, videoUnprotectFail, videoFrameIn, videoSinkMissing, rtcpIn, rtcpAuthFail, groupForwardingInvalid uint64
++	var rtpIn, rtpSeen, unprotectFail, rtpInspect, vidIn, appDataIn, appDataUnprotectFail, videoUnprotectFail, videoFrameIn, videoSinkMissing, rtcpIn, rtcpAuthFail, rtcpUnknownSsrc, groupForwardingInvalid uint64
+ 	for {
+ 		if ctx.Err() != nil {
+ 			return ctx.Err()
+@@ -1004,8 +1004,21 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
+ 			if !ok {
+ 				continue
+ 			}
+-			plain, index, ok := audioReceivers.UnprotectSRTCP(senderSsrc, pkt)
+-			if !ok {
++			plain, index, result := audioReceivers.unprotectSRTCP(senderSsrc, pkt)
++			switch result {
++			case srtcpUnknownSSRC:
++				// Not one of the SSRCs derived for the call's participants:
++				// RTCP from outside the stream plan (seen with ssrc 1 right at
++				// accept, likely the relay). Nothing was authenticated, so it
++				// is not a key problem.
++				if rtcpUnknownSsrc++; rtcpUnknownSsrc == 1 {
++					log.Debug().Uint32("ssrc", senderSsrc).Msg("peer SRTCP from an SSRC outside the call's streams dropped")
++				}
++				e.c.diag.Emit("rtcp", map[string]any{
++					"event": "unknown_ssrc", "ssrc": senderSsrc, "bytes": n,
++				})
++				continue
++			case srtcpAuthFailed:
+ 				if rtcpAuthFail++; rtcpAuthFail == 1 {
+ 					log.Warn().Uint32("ssrc", senderSsrc).Msg("peer SRTCP failed authentication")
+ 				}
+diff --git a/group_media_receive.go b/group_media_receive.go
+index e016e3a..20f3966 100644
+--- a/group_media_receive.go
++++ b/group_media_receive.go
+@@ -787,15 +787,36 @@ func (r *participantAudioReceiver) unprotectedMedia(header rtp.RtpHeader, payloa
+ }
+ 
+ func (r *participantReceiveRegistry) UnprotectSRTCP(senderSSRC uint32, packet []byte) ([]byte, uint32, bool) {
++	plain, index, result := r.unprotectSRTCP(senderSSRC, packet)
++	return plain, index, result == srtcpUnprotected
++}
++
++// srtcpUnprotectResult says why an SRTCP packet was or was not accepted. The
++// receive loop logs the two failures at different levels: an SSRC outside the
++// call's streams was never ours to authenticate (no HMAC is tried), while an
++// HMAC that does not verify on a known SSRC means wrong keys or tampering.
++type srtcpUnprotectResult uint8
++
++const (
++	srtcpUnprotected srtcpUnprotectResult = iota
++	srtcpUnknownSSRC
++	srtcpAuthFailed
++)
++
++func (r *participantReceiveRegistry) unprotectSRTCP(senderSSRC uint32, packet []byte) ([]byte, uint32, srtcpUnprotectResult) {
+ 	// Source of truth: https://github.com/purpshell/meowcaller/blob/cbe1446dabb5842362b1a4362d4100ec15d8254f/datasheets/group-media-key-epoch.md#L104-L136
+ 	r.mu.RLock()
+ 	defer r.mu.RUnlock()
+ 	receiver := r.bySRTCPSSRC[senderSSRC]
+ 	if receiver == nil {
+ 		r.log.Debug().Uint32("ssrc", senderSSRC).Msg("dropping SRTCP from inactive participant SSRC")
+-		return nil, 0, false
++		return nil, 0, srtcpUnknownSSRC
++	}
++	plain, index, ok := receiver.srtcp.unprotect(senderSSRC, packet)
++	if !ok {
++		return nil, 0, srtcpAuthFailed
+ 	}
+-	return receiver.srtcp.unprotect(senderSSRC, packet)
++	return plain, index, srtcpUnprotected
+ }
+ 
+ func (r *participantReceiveRegistry) ActiveParticipantIDs() []string {
+diff --git a/srtcp_unknown_ssrc_test.go b/srtcp_unknown_ssrc_test.go
+new file mode 100644
+index 0000000..d15029f
+--- /dev/null
++++ b/srtcp_unknown_ssrc_test.go
+@@ -0,0 +1,61 @@
++package meowcaller
++
++import (
++	"bytes"
++	"testing"
++
++	"github.com/purpshell/meowcaller/rtp"
++	"github.com/purpshell/meowcaller/srtp"
++)
++
++// An SRTCP packet from an SSRC outside the call's streams (ssrc 1, seen at
++// accept on a real call) is told apart from one whose HMAC does not verify on a
++// known SSRC: the receive loop logs the first at Debug and the second at Warn.
++func TestParticipantReceiveRegistrySeparatesUnknownSSRCFromAuthFailure(t *testing.T) {
++	callKey := iota32()
++	self := mediaTestJID("111111111111111", 14)
++	peer := mediaTestJID("222222222222222", 0)
++	registry, err := newParticipantReceiveRegistry("CID", callKey, self.String(), peer.String(), nil)
++	if err != nil {
++		t.Fatalf("new registry: %v", err)
++	}
++
++	participantID := rtp.FormatE2ESrtpParticipantID(peer.String())
++	peerSSRC, err := rtp.DeriveWasmParticipantSsrc("CID", participantID, 0)
++	if err != nil {
++		t.Fatalf("derive peer SSRC: %v", err)
++	}
++	keys, err := srtp.DeriveE2eSrtcpKeys(callKey, participantID)
++	if err != nil {
++		t.Fatalf("derive peer SRTCP keys: %v", err)
++	}
++	var stats rtp.RtcpSenderStats
++	var cnameEntropy [12]byte
++	cname := rtp.BuildWhatsappRtcpCname(cnameEntropy)
++	plain := rtp.BuildSenderReportWithSdesAndReception(peerSSRC, &stats, 3, &cname, nil, false)
++	protected, err := srtp.ProtectSrtcp(&keys, peerSSRC, 5, plain)
++	if err != nil {
++		t.Fatalf("protect peer SRTCP: %v", err)
++	}
++
++	got, index, result := registry.unprotectSRTCP(peerSSRC, protected)
++	if result != srtcpUnprotected || index != 5 || !bytes.Equal(got, plain) {
++		t.Fatalf("valid peer SRTCP = (%x, %d, %d), want authenticated index 5", got, index, result)
++	}
++
++	tampered := append([]byte(nil), protected...)
++	tampered[len(tampered)-1] ^= 0xff
++	if _, _, result = registry.unprotectSRTCP(peerSSRC, tampered); result != srtcpAuthFailed {
++		t.Fatalf("tampered SRTCP on the peer SSRC = %d, want srtcpAuthFailed", result)
++	}
++	if _, _, ok := registry.UnprotectSRTCP(peerSSRC, tampered); ok {
++		t.Fatal("UnprotectSRTCP accepted a tampered packet")
++	}
++
++	if _, _, result = registry.unprotectSRTCP(1, protected); result != srtcpUnknownSSRC {
++		t.Fatalf("SRTCP from ssrc 1 = %d, want srtcpUnknownSSRC", result)
++	}
++	if _, _, ok := registry.UnprotectSRTCP(1, protected); ok {
++		t.Fatal("UnprotectSRTCP accepted a packet from an unknown SSRC")
++	}
++}

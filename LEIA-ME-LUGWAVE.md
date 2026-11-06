@@ -20,8 +20,9 @@ o `main` do upstream com **três camadas** por cima, cada uma em commits própri
    12/10/2026), o `recover()` nas goroutines e nos ganchos da lib, os testes
    do código de vários relays e o lock que não fica preso depois de um panic
    (desde 16/10/2026), o áudio de saída da chamada recebida esperar o
-   `Answer()` (desde 17/10/2026) e o `recover()` na goroutine que o #50 sobe
-   (desde 30/10/2026). Não são PRs do upstream — é
+   `Answer()` (desde 17/10/2026), o `recover()` na goroutine que o #50 sobe
+   (desde 30/10/2026) e o SRTCP de SSRC desconhecido logado em Debug, não
+   como falha de autenticação (desde 06/11/2026). Não são PRs do upstream — é
    lógica escrita por nós, pequena, e a intenção é propô-la lá. **Aqui a
    lógica também muda.**
 
@@ -212,9 +213,10 @@ a medição e os riscos.
 | 8 | O lock do engine não fica preso depois de um panic de parse; a guarda não espera por ele para sempre; avisos sem o número | Lugwave | `0008-lugwave-lock-apos-panic.patch` |
 | 9 | O áudio de saída da chamada recebida espera o `Answer()` (`WithInboundEarlyMedia`) | Lugwave | `0009-lugwave-audio-ate-atender.patch` |
 | 11 | `recover()` na goroutine do guarda do #50 | Lugwave | `0011-lugwave-recover-guarda-pr50.patch` |
+| 12 | SRTCP de um SSRC fora dos streams da chamada vai para Debug; o Warn fica para HMAC que não confere | Lugwave | `0012-lugwave-srtcp-ssrc-desconhecido.patch` |
 
 As seções abaixo até "Por que não adotamos o hypermeow" são do 0003; o 0006, o
-0007, o 0008, o 0009 e o 0011 estão nas seções seguintes a ele.
+0007, o 0008, o 0009, o 0011 e o 0012 estão nas seções seguintes a ele.
 
 Aplica depois dos dois PRs (mexe no `engine.onAccept` e no `livecall.go`, que
 eles não tocam nesses pontos).
@@ -446,6 +448,34 @@ chamada, em vez de derrubar o processo e com ele todas as conexões.
 **Critério de saída:** sai junto com o 0010, quando o upstream mergear o #50 —
 ou antes, se o upstream ganhar recover equivalente.
 
+## 0012 — SRTCP de SSRC desconhecido não é falha de autenticação
+
+O laço de recepção logava `peer SRTCP failed authentication` (Warn, uma vez por
+chamada) para duas coisas diferentes:
+
+- o pacote cujo SSRC **não é de nenhum participante** — o registry não acha o
+  receptor e devolve falha **sem testar o HMAC**;
+- o pacote de SSRC conhecido cujo **HMAC não confere** (chave errada, ou pacote
+  adulterado).
+
+O primeiro caso foi o visto no CRM, uma vez, com `ssrc=1`, no aceite da primeira
+chamada de saída real (12/10/2026). SSRC 1 não sai da derivação HKDF dos
+participantes: é RTCP de fora do plano de streams (provavelmente do relay), e o
+RTP, com chaves da mesma derivação, autenticou a chamada inteira. O pion/srtp não
+participa desse caminho.
+
+Agora o registry diz por que recusou (`unprotectSRTCP`; o `UnprotectSRTCP`
+exportado segue com a mesma assinatura, por cima dele). SSRC desconhecido vai
+para **Debug**, uma vez por chamada, com o evento de diagnóstico `unknown_ssrc`;
+HMAC que não confere num SSRC conhecido segue **Warn**, como antes. Nenhum
+pacote passa a ser aceito ou descartado de outro jeito — só muda o nível do log.
+
+Teste: `srtcp_unknown_ssrc_test.go` (pacote válido, HMAC adulterado no SSRC do
+participante, e o mesmo pacote com `ssrc=1`).
+
+**Critério de saída:** quando o upstream separar os dois casos — vale propor lá,
+é uma mudança pequena e sem efeito em quem não lê o log.
+
 ## Por que não adotamos o hypermeow
 
 Desde 06/09/2026 o meowcaller importa o hypermeow — um fork do whatsmeow, do
@@ -504,7 +534,8 @@ As tags são `lugwave-v0.0.N`, uma por topo que o CRM pinou, em ordem:
 | `lugwave-v0.0.4` | o topo seguinte de 16/10/2026 | #3459 do CRM depois da revisão (+ 0008) |
 | `lugwave-v0.0.5` | o topo de 17/10/2026 | release 1.50.20 do CRM (+ 0009, o áudio espera o `Answer()`) |
 | `lugwave-v0.0.6` | o topo de 23/10/2026 | PR #3646 do CRM (o whatsmeow sobe de 0722 para `b2b1e71`, o `main` de 17/10/2026; nenhum patch muda) |
-| `lugwave-v0.0.7` | o topo de 30/10/2026 | o CRM a partir deste topo (+ #50 e 0011, o ack de erro do `<accept>` na coexistência) |
+| `lugwave-v0.0.7` | o topo de 30/10/2026 | o CRM antes do 0012 (+ #50 e 0011, o ack de erro do `<accept>` na coexistência) |
+| `lugwave-v0.0.8` | o topo de 06/11/2026 | o CRM a partir deste topo (+ 0012, o SRTCP de SSRC desconhecido em Debug) |
 
 Fora da sequência, `lugwave-exp-audio-ate-atender-1` segura o topo da branch
 experimental `exp/segurar-audio-ate-atender`, que só a branch homônima do CRM
