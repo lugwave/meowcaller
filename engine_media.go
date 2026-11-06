@@ -956,7 +956,7 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 
 	buf := make([]byte, 1500)
 	rtpDedup := newRtpReplayFilter()
-	var rtpIn, rtpSeen, unprotectFail, rtpInspect, vidIn, appDataIn, appDataUnprotectFail, videoUnprotectFail, videoFrameIn, videoSinkMissing, rtcpIn, rtcpAuthFail, groupForwardingInvalid uint64
+	var rtpIn, rtpSeen, unprotectFail, rtpInspect, vidIn, appDataIn, appDataUnprotectFail, videoUnprotectFail, videoFrameIn, videoSinkMissing, rtcpIn, rtcpAuthFail, rtcpUnknownSsrc, groupForwardingInvalid uint64
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -1004,8 +1004,21 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 			if !ok {
 				continue
 			}
-			plain, index, ok := audioReceivers.UnprotectSRTCP(senderSsrc, pkt)
-			if !ok {
+			plain, index, result := audioReceivers.unprotectSRTCP(senderSsrc, pkt)
+			switch result {
+			case srtcpUnknownSSRC:
+				// Not one of the SSRCs derived for the call's participants:
+				// RTCP from outside the stream plan (seen with ssrc 1 right at
+				// accept, likely the relay). Nothing was authenticated, so it
+				// is not a key problem.
+				if rtcpUnknownSsrc++; rtcpUnknownSsrc == 1 {
+					log.Debug().Uint32("ssrc", senderSsrc).Msg("peer SRTCP from an SSRC outside the call's streams dropped")
+				}
+				e.c.diag.Emit("rtcp", map[string]any{
+					"event": "unknown_ssrc", "ssrc": senderSsrc, "bytes": n,
+				})
+				continue
+			case srtcpAuthFailed:
 				if rtcpAuthFail++; rtcpAuthFail == 1 {
 					log.Warn().Uint32("ssrc", senderSsrc).Msg("peer SRTCP failed authentication")
 				}

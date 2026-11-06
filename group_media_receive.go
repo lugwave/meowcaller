@@ -787,15 +787,36 @@ func (r *participantAudioReceiver) unprotectedMedia(header rtp.RtpHeader, payloa
 }
 
 func (r *participantReceiveRegistry) UnprotectSRTCP(senderSSRC uint32, packet []byte) ([]byte, uint32, bool) {
+	plain, index, result := r.unprotectSRTCP(senderSSRC, packet)
+	return plain, index, result == srtcpUnprotected
+}
+
+// srtcpUnprotectResult says why an SRTCP packet was or was not accepted. The
+// receive loop logs the two failures at different levels: an SSRC outside the
+// call's streams was never ours to authenticate (no HMAC is tried), while an
+// HMAC that does not verify on a known SSRC means wrong keys or tampering.
+type srtcpUnprotectResult uint8
+
+const (
+	srtcpUnprotected srtcpUnprotectResult = iota
+	srtcpUnknownSSRC
+	srtcpAuthFailed
+)
+
+func (r *participantReceiveRegistry) unprotectSRTCP(senderSSRC uint32, packet []byte) ([]byte, uint32, srtcpUnprotectResult) {
 	// Source of truth: https://github.com/purpshell/meowcaller/blob/cbe1446dabb5842362b1a4362d4100ec15d8254f/datasheets/group-media-key-epoch.md#L104-L136
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	receiver := r.bySRTCPSSRC[senderSSRC]
 	if receiver == nil {
 		r.log.Debug().Uint32("ssrc", senderSSRC).Msg("dropping SRTCP from inactive participant SSRC")
-		return nil, 0, false
+		return nil, 0, srtcpUnknownSSRC
 	}
-	return receiver.srtcp.unprotect(senderSSRC, packet)
+	plain, index, ok := receiver.srtcp.unprotect(senderSSRC, packet)
+	if !ok {
+		return nil, 0, srtcpAuthFailed
+	}
+	return plain, index, srtcpUnprotected
 }
 
 func (r *participantReceiveRegistry) ActiveParticipantIDs() []string {
